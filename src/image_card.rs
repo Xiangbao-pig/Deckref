@@ -15,10 +15,16 @@ pub struct ImageCard {
     pub file_size: u64,
     pub modified: SystemTime,
     pub anim_scale: f32,
+    /// 用户设置的显示缩放（1.0 = 100%），拿起时滚轮可调，放下后保留
+    pub display_scale: f32,
     /// 基于路径哈希的随机位移（世界坐标），使堆叠更自然
     pub random_offset: Vec2,
     /// 基于路径哈希的随机旋转增量（弧度）
     pub random_rotation: f32,
+    /// 放下后的旋转插值偏移（弧度），每帧向 0 收敛，实现优雅落定
+    pub anim_rotation_offset: f32,
+    /// 位置插值偏移（世界坐标），打散/移动时向零收敛，实现平滑位移动画
+    pub anim_position_delta: Vec2,
 }
 
 impl ImageCard {
@@ -66,6 +72,9 @@ impl ImageCard {
             anim_scale: 1.0,
             random_offset,
             random_rotation,
+            display_scale: 1.0,
+            anim_rotation_offset: 0.0,
+            anim_position_delta: Vec2::ZERO,
         }
     }
 }
@@ -205,6 +214,59 @@ pub const PICK_UP_ANIM_DURATION: f32 = 0.12;
 
 /// 跟手时的平滑系数 (0~1)，越大跟得越紧
 pub const HELD_FOLLOW_SMOOTH: f32 = 0.35;
+
+/// 单张卡片显示缩放下限（30%）
+pub const DISPLAY_SCALE_MIN: f32 = 0.3;
+
+/// 单张卡片显示缩放上限（500%）
+pub const DISPLAY_SCALE_MAX: f32 = 5.0;
+
+/// 拿起时滚轮缩放灵敏度（每像素滚动带来的缩放系数增量）
+pub const WHEEL_SCALE_SENSITIVITY: f32 = 0.0012;
+
+/// 放下后旋转动画的收敛速度（越大越快落定）
+pub const ROTATION_ANIM_SPEED: f32 = 14.0;
+
+/// 打散/位移动画收敛速度（越大越快落定）
+pub const POSITION_ANIM_SPEED: f32 = 10.0;
+
+/// 拖入新图时的落下动画：初始 Y 方向偏移（世界坐标，负表示在上方），每帧向 0 收敛
+pub const DROP_ANIM_INITIAL_OFFSET_Y: f32 = -52.0;
+
+/// 拖入新图时的落下动画：初始缩放，每帧向 1.0 收敛
+pub const DROP_ANIM_INITIAL_SCALE: f32 = 0.88;
+
+/// 位置向量向目标平滑逼近（用于打散等位移动画）
+pub fn lerp_position(current: Vec2, target: Vec2, dt: f32) -> Vec2 {
+    let diff = target - current;
+    if diff.length_sq() < 0.0001 {
+        return target;
+    }
+    current + diff * (1.0 - (-POSITION_ANIM_SPEED * dt).exp())
+}
+
+/// 将角度差归一化到 [-π, π]，用于旋转插值走最短路径
+#[inline]
+pub fn normalize_angle_delta(mut delta: f32) -> f32 {
+    const PI: f32 = std::f32::consts::PI;
+    const TAU: f32 = 2.0 * PI;
+    while delta > PI {
+        delta -= TAU;
+    }
+    while delta < -PI {
+        delta += TAU;
+    }
+    delta
+}
+
+/// 旋转角度向目标平滑逼近（弧度），走最短路径
+pub fn lerp_rotation(current: f32, target: f32, dt: f32) -> f32 {
+    let diff = normalize_angle_delta(target - current);
+    if diff.abs() < 0.0005 {
+        return target;
+    }
+    current + diff * (1.0 - (-ROTATION_ANIM_SPEED * dt).exp())
+}
 
 pub fn lerp_scale(current: f32, target: f32, dt: f32) -> f32 {
     let diff = target - current;

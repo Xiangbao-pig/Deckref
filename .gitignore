@@ -13,6 +13,7 @@ secrets.*
 # IDE / 编辑器
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~

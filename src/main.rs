@@ -13,7 +13,8 @@ fn main() -> Result<(), AppError> {
             .with_decorations(true)   // 标题栏：关闭、最小化按钮
             .with_resizable(true)     // 支持拖拽边框调整大小
             .with_always_on_top()
-            .with_inner_size([360.0, 240.0]),
+            .with_inner_size([360.0, 240.0])
+            .with_drag_and_drop(true), // 接受从浏览器/文件夹拖入的图片；否则会显示禁止标志
         ..Default::default()
     };
 
