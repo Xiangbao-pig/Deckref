@@ -1,0 +1,24 @@
+# Rust
+/target
+**/*.rs.bk
+
+# 环境与敏感信息（切勿提交）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统与临时
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
