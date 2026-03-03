@@ -6,6 +6,9 @@ pub mod image_card;
 pub mod image_ops;
 pub mod watcher;
 
+#[cfg(windows)]
+pub mod win_drop;
+
 pub use app::DeckRefApp;
 pub use error::AppError;
 pub use image_card::{CardSortOrder, ImageCard, StackLayout};

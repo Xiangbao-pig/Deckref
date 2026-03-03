@@ -4,6 +4,40 @@ use crate::error::{AppError, AppResult};
 use image::{DynamicImage, ImageFormat};
 use std::path::{Path, PathBuf};
 
+/// 解析 assets 下 logo/窗口图标的路径：优先 icon.png，其次 main icon.png。
+/// 查找顺序：manifest 目录（cargo run）→ exe 同目录 → 当前目录。
+pub fn resolve_assets_icon_path() -> Option<PathBuf> {
+    let names = ["icon.png", "main icon.png"];
+    let try_root = |root: &Path| -> Option<PathBuf> {
+        for name in &names {
+            let p = root.join("assets").join(name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        None
+    };
+    #[allow(deprecated)]
+    if let Some(root) = option_env!("CARGO_MANIFEST_DIR").map(PathBuf::from) {
+        if let Some(p) = try_root(&root) {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe.parent() {
+            if let Some(p) = try_root(root) {
+                return Some(p);
+            }
+        }
+    }
+    if let Ok(root) = std::env::current_dir() {
+        if let Some(p) = try_root(&root) {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// 常见图片扩展名（与 watcher 一致），用于快捷抓图时判断是否为图片。
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"];
 
@@ -62,6 +96,24 @@ pub fn save_image_from_bytes(data: &[u8], path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+/// 将原始 RGBA 像素数据（行优先，每像素 4 字节）保存为 PNG。用于剪贴板粘贴等。
+pub fn save_rgba_as_png(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    path: &Path,
+) -> AppResult<()> {
+    use image::ImageBuffer;
+    let buf = ImageBuffer::from_raw(width, height, rgba.to_vec())
+        .ok_or_else(|| AppError::Other("剪贴板图像尺寸与字节数不匹配".into()))?;
+    let img = image::DynamicImage::ImageRgba8(buf);
+    let mut out = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut out);
+    img.write_to(&mut cursor, ImageFormat::Png).map_err(AppError::Image)?;
+    std::fs::write(path, out).map_err(AppError::Io)?;
+    Ok(())
+}
+
 /// 将本地图片文件复制到目标目录，使用唯一文件名（原主名_时间戳.扩展名），避免覆盖。
 /// 仅当源路径为支持的图片格式时复制；返回新文件路径。
 pub fn copy_image_to_dir(src: &Path, dest_dir: &Path) -> AppResult<PathBuf> {
@@ -87,6 +139,13 @@ pub fn copy_image_to_dir(src: &Path, dest_dir: &Path) -> AppResult<PathBuf> {
 /// 在目标目录生成一个唯一文件名（capture_时间戳.png），用于无文件名时的抓图保存。
 pub fn unique_capture_path(dest_dir: &Path) -> PathBuf {
     let name = format!("capture_{}.png", chrono_timestamp());
+    dest_dir.join(name)
+}
+
+/// 用于 Windows 虚拟文件拖入：在目标目录生成唯一路径（drop_时间戳_序号.扩展名），避免覆盖。
+pub fn unique_path_for_drop(dest_dir: &Path, index: u32) -> PathBuf {
+    let ext = "png";
+    let name = format!("drop_{}_{}.{}", chrono_timestamp(), index, ext);
     dest_dir.join(name)
 }
 

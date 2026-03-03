@@ -24,13 +24,13 @@ cargo run --release
 | [docs/WORKFLOW.md](docs/WORKFLOW.md) | Agent 协作与开发流程 |
 | [AGENTS.md](AGENTS.md) | Agent 使用约定 |
 
-## 今日开发进展（2025-03-02）
+## 今日开发进展（2025-03-03）
 
-- **代码同步至 GitHub**：将当前功能与文档完整推送到私有仓库 [Xiangbao-pig/Deckref](https://github.com/Xiangbao-pig/Deckref)。
+- **代码同步至 GitHub**：将本次功能与文档推送到 [Xiangbao-pig/Deckref](https://github.com/Xiangbao-pig/Deckref)。
 - **本次提交包含**：
-  - 拖放与拖出：窗口支持接收外部拖入、长按拿起后移出窗口边缘触发系统拖放。
-  - 快捷抓图：拖入图片保存到监听目录（本地文件复制、纯数据保存为 PNG）；已在目录内的图仅置顶不复制；新加入图片带落下动画。
-  - 依赖：新增 `rand`，其它见 `Cargo.toml` / `Cargo.lock`。
-  - 文档：`CHANGELOG.md`、`docs/`（INTERACTIONS、WORKFLOW、VISION 等）、`AGENTS.md`；`.gitignore` 排除 `target`、`.cursor`、敏感文件等。
+  - **Windows 浏览器拖入**：自实现 OLE 拖放目标（`src/win_drop.rs`），支持 **CF_HDROP** 与 **FileGroupDescriptorW/FileContents**，从 Chrome、Edge 等网页拖入图片即可保存到监听目录并加入堆叠；技术说明见 `docs/FEATURE_CHROME_DROP_IMPL.md`、`docs/CHROME_DRAG_DROP_REPORT.md`。
+  - **剪贴板粘贴**：支持 **Ctrl+V**（Mac：Cmd+V）从剪贴板粘贴图片并保存到监听目录（依赖 `arboard`），作为浏览器拖入无效时的备用方案。
+  - **依赖**：新增 `arboard`；Windows 目标下新增 `windows`、`raw-window-handle`（OLE/COM 拖放）。
+  - **文档**：更新 `docs/INTERACTIONS.md`、`docs/WORKFLOW.md`、`AGENTS.md`。
 
 更细的变更按日期见 [CHANGELOG.md](CHANGELOG.md)。

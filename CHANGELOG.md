@@ -8,6 +8,8 @@
 
 ## 未发布
 
+- **2025-03-03** 同步代码至 GitHub：Windows OLE 拖放（Chrome/Edge 网页图拖入）、剪贴板粘贴图片（Ctrl+V）、`win_drop` 模块与文档。涉及：`src/win_drop.rs`、`src/app.rs`、`src/main.rs`、`src/image_ops.rs`、`arboard`、`docs/FEATURE_CHROME_DROP_IMPL.md`、`docs/CHROME_DRAG_DROP_REPORT.md`。
+- **2025-03-03** Chrome 拖入备用方案：支持 Ctrl+V（Mac：Cmd+V）从剪贴板粘贴图片并保存到监听目录，不涉及额外权限；从 Chrome 拖入无效时可用「复制图片 → 粘贴」。涉及：`arboard`、`src/image_ops.rs`、`src/app.rs`、`docs/INTERACTIONS.md`。
 - **2025-03-02** 同步代码至 GitHub：提交拖放、快捷抓图、监听与文档等改动；新增 `README.md`，完善 `.gitignore`（排除 `.cursor/`）。仓库：https://github.com/Xiangbao-pig/Deckref
 - **2025-03-03** 拖出触发改为「指针离开窗口边缘」：拿起后仅在鼠标移出窗口边界时转为系统文件拖放，更符合直觉。涉及：`src/app.rs`、`docs/INTERACTIONS.md`。
 - **2025-03-03** 拖放修复与拖出：窗口启用 `with_drag_and_drop(true)`，从浏览器拖入图片不再显示禁止标志；长按拿起后移动超过约 18px 会发起系统文件拖放，可拖到文件夹或其它软件。涉及：`src/main.rs`、`src/app.rs`、`docs/INTERACTIONS.md`。

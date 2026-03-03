@@ -97,4 +97,15 @@
 - **功能完成后留痕**：更新对应 docs → 在 CHANGELOG.md 追加一条 → 提交时带上文档与 CHANGELOG。
 - **新手技巧**：多用 @ 引用文档、用 Rules 固化流程、一功能一留痕、新对话先读 AGENTS + CHANGELOG。
 
+## 六、分支使用：美术效果分支
+
+- **分支名**：`feature/art-effects`（专门做视觉效果、渲染、阴影、动画等）。
+- **创建并切换**（在项目根目录执行）：
+  ```bash
+  git checkout -b feature/art-effects
+  ```
+  若当前不在 `main`，可先 `git checkout main` 再执行上式。
+- **日常使用**：做美术/视觉效果相关改动前先 `git checkout feature/art-effects`，在该分支上提交；审完后再合并到 `main`（如通过 PR 或本地 `git merge feature/art-effects`）。
+- **与 Agent 协作**：在 AGENTS.md 的「分支约定」中已注明美术效果在 `feature/art-effects`，Agent 在做该类改动时应先切换到此分支再改。
+
 维护好这套流程，后续无论是你还是其他 Agent，都能快速对齐并延续开发。

@@ -3,18 +3,28 @@
 use deckref::{AppError, DeckRefApp};
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn main() -> Result<(), AppError> {
     let watch_path = resolve_pictures_ref_dir()?;
 
+    let icon = load_window_icon();
+    let viewport = egui::ViewportBuilder::default()
+        .with_transparent(true)
+        .with_decorations(true)   // 标题栏：关闭、最小化按钮
+        .with_resizable(true)     // 支持拖拽边框调整大小
+        .with_always_on_top()
+        .with_inner_size([360.0, 240.0])
+        .with_drag_and_drop(true); // 接受从浏览器/文件夹拖入的图片；否则会显示禁止标志
+
+    let viewport = if let Some(icon) = icon {
+        viewport.with_icon(icon)
+    } else {
+        viewport
+    };
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_transparent(true)
-            .with_decorations(true)   // 标题栏：关闭、最小化按钮
-            .with_resizable(true)     // 支持拖拽边框调整大小
-            .with_always_on_top()
-            .with_inner_size([360.0, 240.0])
-            .with_drag_and_drop(true), // 接受从浏览器/文件夹拖入的图片；否则会显示禁止标志
+        viewport,
         ..Default::default()
     };
 
@@ -23,14 +33,56 @@ fn main() -> Result<(), AppError> {
         options,
         Box::new(move |cc| {
             configure_cjk_fonts(cc);
-            match create_app(watch_path) {
-                Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
+            match create_app(watch_path.clone()) {
+                Ok(mut app) => {
+                    #[cfg(windows)]
+                    {
+                        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        if let Ok(handle) = cc.window_handle().map(|h| h.as_raw()) {
+                            if let RawWindowHandle::Win32(win) = handle {
+                                let hwnd = win.hwnd.get() as isize;
+                                app.set_win_drop_pending_hwnd(hwnd);
+                            }
+                        }
+                    }
+                    Ok(Box::new(app) as Box<dyn eframe::App>)
+                }
                 Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
             }
         }),
     );
 
     result.map_err(|e| AppError::Other(e.to_string()))
+}
+
+/// 解析 assets/icon.png 的路径：优先 manifest 目录（cargo run），其次 exe 同目录，再次当前目录。
+fn resolve_assets_icon_path() -> Option<PathBuf> {
+    deckref::image_ops::resolve_assets_icon_path()
+}
+
+/// 加载窗口图标（32x32 RGBA），失败时返回 None，不阻塞启动。
+fn load_window_icon() -> Option<Arc<eframe::egui::IconData>> {
+    let path = resolve_assets_icon_path()?;
+    let img = image::ImageReader::open(path).ok()?.decode().ok()?;
+    let img = img.into_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let img = if w > 32 || h > 32 {
+        image::imageops::resize(
+            &img,
+            32,
+            32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    let (w, h) = (img.width(), img.height());
+    let rgba = img.into_raw();
+    Some(Arc::new(eframe::egui::IconData {
+        rgba,
+        width: w,
+        height: h,
+    }))
 }
 
 /// 解析用户目录下的 Pictures/Ref 路径；若目录不存在则创建。
