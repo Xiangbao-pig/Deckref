@@ -9,13 +9,20 @@ fn main() -> Result<(), AppError> {
     let watch_path = resolve_pictures_ref_dir()?;
 
     let icon = load_window_icon();
-    let viewport = egui::ViewportBuilder::default()
+    let inner_size = deckref::window_state::initial_inner_size();
+    let min_size = deckref::window_state::min_inner_size();
+    let mut viewport = egui::ViewportBuilder::default()
         .with_transparent(true)
         .with_decorations(true)   // 标题栏：关闭、最小化按钮
         .with_resizable(true)     // 支持拖拽边框调整大小
         .with_always_on_top()
-        .with_inner_size([360.0, 240.0])
+        .with_inner_size(inner_size)
+        .with_min_inner_size(min_size)
         .with_drag_and_drop(true); // 接受从浏览器/文件夹拖入的图片；否则会显示禁止标志
+
+    if let Some([px, py]) = deckref::window_state::initial_position() {
+        viewport = viewport.with_position(egui::Pos2::new(px, py));
+    }
 
     let viewport = if let Some(icon) = icon {
         viewport.with_icon(icon)

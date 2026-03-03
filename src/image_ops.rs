@@ -4,15 +4,29 @@ use crate::error::{AppError, AppResult};
 use image::{DynamicImage, ImageFormat};
 use std::path::{Path, PathBuf};
 
-/// 解析 assets 下 logo/窗口图标的路径：优先 icon.png，其次 main icon.png。
+/// 解析 assets 下 logo/窗口图标的路径：优先 icon.png，其次 main icon.png，再则任意含 icon 的 png。
 /// 查找顺序：manifest 目录（cargo run）→ exe 同目录 → 当前目录。
 pub fn resolve_assets_icon_path() -> Option<PathBuf> {
-    let names = ["icon.png", "main icon.png"];
     let try_root = |root: &Path| -> Option<PathBuf> {
-        for name in &names {
-            let p = root.join("assets").join(name);
+        let assets_dir = root.join("assets");
+        let fixed = ["icon.png", "main icon.png"];
+        for name in &fixed {
+            let p = assets_dir.join(name);
             if p.exists() {
                 return Some(p);
+            }
+        }
+        // 支持替换后的长文件名等：assets 下任意含 "icon" 的 png
+        if let Ok(entries) = std::fs::read_dir(&assets_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().map_or(false, |e| e.eq_ignore_ascii_case("png"))
+                    && p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map_or(false, |s| s.to_lowercase().contains("icon"))
+                {
+                    return Some(p);
+                }
             }
         }
         None
@@ -162,4 +176,42 @@ fn chrono_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}_{:03}", d.as_secs(), d.subsec_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn is_image_path_accepts_supported_extensions() {
+        assert!(is_image_path(Path::new("a.png")));
+        assert!(is_image_path(Path::new("b.JPG")));
+        assert!(is_image_path(Path::new("c.jpeg")));
+        assert!(is_image_path(Path::new("d.gif")));
+        assert!(is_image_path(Path::new("e.webp")));
+    }
+
+    #[test]
+    fn is_image_path_rejects_non_image() {
+        assert!(!is_image_path(Path::new("x.txt")));
+        assert!(!is_image_path(Path::new("y")));
+        assert!(!is_image_path(Path::new("z.png.exe")));
+    }
+
+    #[test]
+    fn unique_capture_path_has_expected_format() {
+        let dir = Path::new(".");
+        let p = unique_capture_path(dir);
+        assert!(p.file_name().unwrap().to_str().unwrap().starts_with("capture_"));
+        assert!(p.extension().map_or(false, |e| e == "png"));
+    }
+
+    #[test]
+    fn unique_path_for_drop_has_expected_format() {
+        let dir = Path::new(".");
+        let p = unique_path_for_drop(dir, 0);
+        assert!(p.file_name().unwrap().to_str().unwrap().starts_with("drop_"));
+        assert!(p.to_string_lossy().ends_with("_0.png"));
+    }
 }

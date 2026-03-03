@@ -275,10 +275,14 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for WinDropTarget {
             return Ok(());
         };
 
-        for path in extract_hdrop_paths(data_obj) {
-            let _ = self.sender.send(path);
+        let hdrop_paths = extract_hdrop_paths(data_obj);
+        for path in &hdrop_paths {
+            let _ = self.sender.send(path.clone());
         }
-        extract_file_contents_paths(data_obj, &self.watch_path, &self.sender);
+        // 若已有 CF_HDROP 路径（如从本窗口拖出又拖回），不再用 FileContents 写新文件，避免重复保存
+        if hdrop_paths.is_empty() {
+            extract_file_contents_paths(data_obj, &self.watch_path, &self.sender);
+        }
         Ok(())
     }
 }

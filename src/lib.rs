@@ -4,10 +4,16 @@ pub mod app;
 pub mod error;
 pub mod image_card;
 pub mod image_ops;
+pub mod mode;
+pub mod settings;
 pub mod watcher;
+pub mod window_state;
 
 #[cfg(windows)]
 pub mod win_drop;
+
+#[cfg(windows)]
+pub mod win_recent;
 
 pub use app::DeckRefApp;
 pub use error::AppError;

@@ -62,22 +62,30 @@ pub fn run_watcher(
 
 /// 扫描目录中已有图片路径（用于启动时加载），按修改时间新→旧排序。
 pub fn list_existing_image_paths(dir: &Path) -> AppResult<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+    let with_meta = list_existing_image_paths_with_metadata(dir, usize::MAX)?;
+    Ok(with_meta.into_iter().map(|(p, _, _)| p).collect())
+}
+
+/// 扫描目录中已有图片路径并带元数据（一次 metadata 用于排序与构造卡片），按修改时间新→旧，最多 `max` 条。
+/// 返回 `(PathBuf, file_size, modified)`，供后台线程再取 dimensions 后构造 ImageCard，避免主线程重复 IO。
+pub fn list_existing_image_paths_with_metadata(
+    dir: &Path,
+    max: usize,
+) -> AppResult<Vec<(PathBuf, u64, SystemTime)>> {
+    let mut entries: Vec<(PathBuf, u64, SystemTime)> = std::fs::read_dir(dir)
         .map_err(AppError::Io)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_file() && is_image_path(p))
+        .filter_map(|p| {
+            std::fs::metadata(&p)
+                .ok()
+                .map(|m| (p, m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+        })
         .collect();
-    paths.sort_by(|a, b| {
-        let ta = std::fs::metadata(a)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let tb = std::fs::metadata(b)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        tb.cmp(&ta)
-    });
-    Ok(paths)
+    entries.sort_by(|a, b| b.2.cmp(&a.2));
+    entries.truncate(max);
+    Ok(entries)
 }
 
 fn run_watcher_loop(

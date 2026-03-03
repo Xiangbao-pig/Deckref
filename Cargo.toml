@@ -31,3 +31,4 @@ windows = { version = "0.52", features = [
     "implement",
 ] }
 raw-window-handle = "0.6"
+lnk = "0.6"

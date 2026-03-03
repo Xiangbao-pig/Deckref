@@ -25,7 +25,7 @@
 - **image_card.rs**：`ImageCard` 结构、堆叠布局、命中检测、绘制（mesh/阴影）、动画插值
 - **error.rs**：统一错误类型与 `AppResult`
 
-整体是「单主线程 UI + 一个监听线程」的架构，无额外线程池或异步任务。
+整体是「单主线程 UI + 一个监听线程 + 一个按需存在的加载线程」的架构；启动时不再阻塞主线程。
 
 ---
 
@@ -38,28 +38,28 @@ main
   → resolve_pictures_ref_dir()           // 目录解析/创建
   → eframe::run_native(..., create_app)
        → configure_cjk_fonts(cc)        // 读字体文件入内存，一次性
-       → DeckRefApp::new(watch_path)
+       → DeckRefApp::new(base_path)
             → mpsc::channel() + run_watcher(…)   // 启动监听线程
-            → load_existing_images()     // 见下
+            → start_async_load()        // 见下（不再阻塞主线程）
 ```
 
-**load_existing_images()**（在 `App::new` 内，主线程）：
+**start_async_load()**（在 `App::new` 与切换模式无缓存时调用）：
 
-1. `list_existing_image_paths(dir)`  
-   - `read_dir` 遍历，按扩展名过滤  
-   - 对每个文件 `metadata(p).modified()` 用于排序（每个文件一次 IO）  
-   - 返回按修改时间排序的路径列表
-2. 对每条路径（最多 `MAX_CARDS`，当前 80）：  
-   - `image_ops::image_dimensions(&path)` → 打开文件读头部/解码头  
-   - `ImageCard::from_path(path, intrinsic)` → 内部再次 `std::fs::metadata(&path)` 取 size/modified  
+1. 若存在未结束的上次加载，先 drop 对应 receiver 并 join 旧线程。
+2.  spawn 后台线程 `deckref-loader`，传入当前 `mode` 与 `watch_path`。
+3. 后台线程：
+   - **默认模式**：`list_existing_image_paths_with_metadata(watch_path, MAX_CARDS)`（一次 read_dir + 每文件一次 metadata 用于排序与元数据，无重复 IO），对每条 `(path, file_size, modified)` 调用 `image_ops::image_dimensions(&path)`，通过 channel 发送 `(path, (w,h), (file_size, modified))`。
+   - **灵感模式**（Windows）：`win_recent::list_recent_image_paths(max)`，对每条 path 读 metadata + dimensions，再发送；非 Windows 同默认模式逻辑、使用 `watch_path`。
+4. 主线程每帧在 `run_ui` 中调用 `poll_loading_cards()`：`try_recv` 消费 channel，用 `ImageCard::from_path_with_metadata(path, intrinsic, file_size, modified)` 构造卡片并 push（不读 metadata，无重复 IO）；当 channel 关闭（Disconnected）时 join 加载线程。
 
-**结论**：启动时主线程串行做「目录遍历 + 每文件多次 IO（metadata + dimensions）」，卡片多时启动会明显阻塞；同一文件的 metadata 在排序与 `from_path` 中重复访问。
+**结论**：启动时主线程不再串行做目录遍历与每文件多次 IO；窗口可立即显示，卡片随加载完成逐步出现。同一文件的 metadata 仅在后台线程读取一次，主线程用 `from_path_with_metadata` 零 IO 构造卡片。spawn 失败时回退到同步 `load_existing_images()`。
 
 ### 2.2 每帧主循环（run_ui）
 
 ```
 update() → run_ui(ctx, frame)
   → poll_watch_events()                  // try_recv 消费所有 pending
+  → poll_loading_cards()                // 消费异步加载线程发来的卡片
   → 底部栏 / CentralPanel UI
   → 堆叠区域：
        → 命中检测（从最前到最后，每卡 position_and_rotation + rotated_rect_contains）
@@ -100,7 +100,7 @@ update() → run_ui(ctx, frame)
 以下为后续可优先考虑的「关键节点」，当前仅作记录。
 
 1. **主线程阻塞**
-   - 启动：`load_existing_images` 中目录扫描 + 每文件多次 metadata/dimensions，全部在主线程。
+   - ~~启动：`load_existing_images` 中目录扫描 + 每文件多次 metadata/dimensions，全部在主线程。~~ **已优化**：启动改为 `start_async_load` + 后台线程 + `poll_loading_cards` 消费。
    - 每帧：所有 UI、命中检测、动画、纹理未命中时的解码、绘制，均在同一线程。
 
 2. **纹理与图片**
@@ -112,7 +112,7 @@ update() → run_ui(ctx, frame)
    - 对全部卡片做命中检测、动画更新、ensure_texture；无视口剔除或 LOD，卡片数固定上限 80。
 
 4. **IO 重复与一致性**
-   - 启动：同一文件的 metadata 在排序与 `ImageCard::from_path` 中各用一次；dimensions 与 from_path 分开调用，存在重复打开文件。
+   - ~~启动：同一文件的 metadata 在排序与 `ImageCard::from_path` 中各用一次；dimensions 与 from_path 分开调用，存在重复打开文件。~~ **已优化**：启动使用 `list_existing_image_paths_with_metadata`（一次 metadata）+ 后台线程 `image_dimensions` + 主线程 `from_path_with_metadata`（零 IO）。
    - 监听事件处理：每个事件一次 dimensions + 一次 from_path（内部 metadata），与启动类似。
 
 5. **刷新与输入**
@@ -130,7 +130,7 @@ update() → run_ui(ctx, frame)
 
 - **MAX_CARDS** = 80，当前单列表、单 cache 规模固定。
 - **防抖** = 400ms，监听侧已做合并。
-- **无异步运行时**：若未来将 IO 或解码移出主线程，需要自行 spawn 或引入轻量异步/线程池。
+- **无异步运行时**：启动阶段已通过独立加载线程 + mpsc 移出主线程；若未来将纹理解码等移出主线程，可继续用 spawn + channel 或引入轻量线程池。
 - **egui**：即时模式、每帧重算 UI，纹理通过 ctx 管理；大纹理数量与尺寸会直接影响显存与上传成本。
 
 ---
@@ -138,8 +138,8 @@ update() → run_ui(ctx, frame)
 ## 五、报告结论
 
 - **架构**：单主线程 UI + 单监听线程，模块边界清晰（app / watcher / image_ops / image_card），便于后续在「不改功能」前提下做性能优化。
-- **关键节点**：启动阶段的主线程 IO 与重复 metadata/dimensions；每帧的全局 ensure_texture（及主线程解码）；全量原图纹理无缩略图；每帧 paths 克隆与全卡命中/动画/绘制。
-- 本期仅做上述观察与标注，**不做具体优化**；在关键节点需要优化时再针对上述项逐项实施。
+- **关键节点**：~~启动阶段的主线程 IO 与重复 metadata/dimensions~~（已优化为异步加载）；每帧的全局 ensure_texture（及主线程解码）；全量原图纹理无缩略图；每帧 paths 克隆与全卡命中/动画/绘制。
+- 启动阶段优化已实施（后台加载线程 + 单次 metadata）；其余关键节点在需要时再针对实施。
 
 ---
 

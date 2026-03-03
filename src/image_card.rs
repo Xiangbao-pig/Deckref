@@ -41,14 +41,24 @@ impl ImageCard {
 
     /// 从路径与图片尺寸创建卡片；元数据读取失败时使用默认值。
     pub fn from_path(path: PathBuf, intrinsic_size: Vec2) -> Self {
+        let (file_size, modified) = std::fs::metadata(&path)
+            .map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+            .unwrap_or((0, SystemTime::UNIX_EPOCH));
+        Self::from_path_with_metadata(path, intrinsic_size, file_size, modified)
+    }
+
+    /// 从路径、尺寸与已读元数据创建卡片（用于异步加载，避免重复 IO）。
+    pub fn from_path_with_metadata(
+        path: PathBuf,
+        intrinsic_size: Vec2,
+        file_size: u64,
+        modified: SystemTime,
+    ) -> Self {
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        let (file_size, modified) = std::fs::metadata(&path)
-            .map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
-            .unwrap_or((0, SystemTime::UNIX_EPOCH));
         let max_side = intrinsic_size.x.max(intrinsic_size.y).max(1.0);
         let display_size = if max_side <= 0.0 {
             Vec2::new(220.0, 220.0)
