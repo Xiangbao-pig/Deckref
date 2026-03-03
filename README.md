@@ -3,8 +3,13 @@
 Rust 桌面应用：图片堆叠浏览与快捷抓图（eframe + egui + 文件监听）。
 
 - **监听目录**：指定文件夹，新放入的图片自动加入堆叠。
-- **拖入即存**：从浏览器或任意软件将图片拖入窗口，保存到监听目录并加入堆叠（本地文件复制保留格式，纯数据保存为 PNG）。
-- **拖出到系统**：长按拿起卡片后，将指针移出窗口边缘即可拖到文件夹或其它软件。
+- **双模式**：**默认**（自选监听路径）与 **灵感**（Windows 下展示「最近使用的文件」中的图片，保存到 `Pictures/Ref/Inspiration`）；切换时保留另一模式缓存，不重扫磁盘。
+- **地址栏**：面包屑导航（点击段落跳转）、▾ 子目录与 **最近到访** 下拉（5 条持久化），支持 **输入/粘贴路径** 跳转；**后退/前进** 导航；启动时**恢复上次关闭时的文件夹**。
+- **拖入即存**：从浏览器或任意软件将图片拖入窗口，保存到监听目录并加入堆叠（本地文件复制保留格式，纯数据保存为 PNG）；Windows 下支持 Chrome/Edge 网页图 OLE 拖放。
+- **剪贴板**：**Ctrl+V**（Mac：Cmd+V）粘贴图片并保存，可作为浏览器拖入的备用。
+- **拖出到系统**：长按拿起卡片后，将指针移出窗口边缘即可拖到文件夹或其它软件；拖出又拖回仅置顶不复制。
+- **设置持久化**：反转平移方向、贴图拖拽出窗口等保存到配置目录，窗口尺寸与上次路径一并恢复。
+- **启动**：目录扫描与元数据在后台线程异步加载，避免卡顿。
 - **交互**：悬停放大、中键平移、滚轮缩放视图、长按拿起/松手放下、单卡滚轮缩放、一览打散等。详见 [docs/INTERACTIONS.md](docs/INTERACTIONS.md)。
 
 ## 构建与运行
@@ -21,16 +26,15 @@ cargo run --release
 |------|------|
 | [CHANGELOG.md](CHANGELOG.md) | 功能与修复记录 |
 | [docs/INTERACTIONS.md](docs/INTERACTIONS.md) | 交互方式说明 |
+| [docs/SETTINGS.md](docs/SETTINGS.md) | 设置项说明与存储约定 |
 | [docs/WORKFLOW.md](docs/WORKFLOW.md) | Agent 协作与开发流程 |
 | [AGENTS.md](AGENTS.md) | Agent 使用约定 |
 
 ## 今日开发进展（2025-03-03）
 
-- **代码同步至 GitHub**：将本次功能与文档推送到 [Xiangbao-pig/Deckref](https://github.com/Xiangbao-pig/Deckref)。
-- **本次提交包含**：
-  - **Windows 浏览器拖入**：自实现 OLE 拖放目标（`src/win_drop.rs`），支持 **CF_HDROP** 与 **FileGroupDescriptorW/FileContents**，从 Chrome、Edge 等网页拖入图片即可保存到监听目录并加入堆叠；技术说明见 `docs/FEATURE_CHROME_DROP_IMPL.md`、`docs/CHROME_DRAG_DROP_REPORT.md`。
-  - **剪贴板粘贴**：支持 **Ctrl+V**（Mac：Cmd+V）从剪贴板粘贴图片并保存到监听目录（依赖 `arboard`），作为浏览器拖入无效时的备用方案。
-  - **依赖**：新增 `arboard`；Windows 目标下新增 `windows`、`raw-window-handle`（OLE/COM 拖放）。
-  - **文档**：更新 `docs/INTERACTIONS.md`、`docs/WORKFLOW.md`、`AGENTS.md`。
+- **双模式**：默认 / 灵感（灵感模式 Windows 下展示「最近使用的文件」图片，保存到 Inspiration 目录）；模式切换保留缓存。
+- **地址栏**：面包屑点击跳转、子目录 ▾、**最近到访** 下拉（5 条持久化）、输入/粘贴路径、后退/前进；启动恢复上次文件夹。
+- **设置与状态**：设置持久化（反转平移、拖拽出窗口）；窗口尺寸与上次路径恢复；配置目录 `last_path.txt` / `recent_folders.txt` / `settings.txt`。
+- **体验与修复**：启动异步加载（后台扫描与元数据）；拖出又拖回仅置顶不复制；HDROP 与 FileContents 二选一避免重复保存；文档 `SETTINGS.md`、`TESTING.md`。
 
 更细的变更按日期见 [CHANGELOG.md](CHANGELOG.md)。
