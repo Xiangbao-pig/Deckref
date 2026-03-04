@@ -156,6 +156,52 @@ pub fn unique_capture_path(dest_dir: &Path) -> PathBuf {
     dest_dir.join(name)
 }
 
+/// 在截图目录生成下一个序号文件名 screenshot-N.png（N 为当前目录中已有 screenshot-*.png 的最大编号+1）。
+/// 用于运行时监听到剪贴板截图后自动保存到截图文件夹。
+pub fn next_screenshot_path(screenshot_dir: &Path) -> PathBuf {
+    let mut max_n: u32 = 0;
+    if let Ok(entries) = std::fs::read_dir(screenshot_dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with("screenshot-") && name.ends_with(".png") {
+                let num: Option<u32> = name
+                    .trim_start_matches("screenshot-")
+                    .trim_end_matches(".png")
+                    .parse()
+                    .ok();
+                if let Some(n) = num {
+                    max_n = max_n.max(n);
+                }
+            }
+        }
+    }
+    screenshot_dir.join(format!("screenshot-{}.png", max_n + 1))
+}
+
+/// 列出截图目录下 screenshot-*.png 文件，按编号升序（screenshot-1, screenshot-2, ...）。用于灵感模式合并展示。
+pub fn list_screenshot_paths_ordered(screenshot_dir: &Path) -> Vec<PathBuf> {
+    let mut pairs: Vec<(u32, PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(screenshot_dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with("screenshot-") && name.ends_with(".png") {
+                let num: Option<u32> = name
+                    .trim_start_matches("screenshot-")
+                    .trim_end_matches(".png")
+                    .parse()
+                    .ok();
+                if let Some(n) = num {
+                    pairs.push((n, path));
+                }
+            }
+        }
+    }
+    pairs.sort_by_key(|(n, _)| *n);
+    pairs.into_iter().map(|(_, p)| p).collect()
+}
+
 /// 用于 Windows 虚拟文件拖入：在目标目录生成唯一路径（drop_时间戳_序号.扩展名），避免覆盖。
 pub fn unique_path_for_drop(dest_dir: &Path, index: u32) -> PathBuf {
     let ext = "png";

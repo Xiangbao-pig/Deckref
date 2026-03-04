@@ -14,6 +14,7 @@ use crate::watcher::{list_existing_image_paths_with_metadata, list_existing_imag
 use crate::window_state;
 use eframe::egui::{self, ColorImage, Rect, TextureHandle, Vec2};
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf, Component};
 use std::ffi::OsString;
 use std::sync::mpsc;
@@ -90,10 +91,26 @@ fn path_breadcrumbs(path: &Path) -> Vec<(PathBuf, OsString)> {
     out
 }
 
-/// 后台加载线程：扫描目录/最近文件，取 dimensions+metadata 后通过 channel 发送，主线程用 from_path_with_metadata 构造卡片。
+/// 列出指定目录下的子文件夹（按名称排序，最多 limit 个）。用于面包屑每级右侧的下拉菜单。
+fn list_subdirs(path: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut d: Vec<PathBuf> = match std::fs::read_dir(path) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => return vec![],
+    };
+    d.sort_by_cached_key(|p| p.file_name().unwrap_or_default().to_string_lossy().to_lowercase());
+    d.truncate(limit);
+    d
+}
+
+/// 后台加载线程：扫描目录/最近文件/截图目录，取 dimensions+metadata 后通过 channel 发送，主线程用 from_path_with_metadata 构造卡片。
 fn run_loader_thread(
     mode: AppMode,
     watch_path: PathBuf,
+    screenshot_dir: PathBuf,
     tx: mpsc::Sender<(PathBuf, (u32, u32), (u64, SystemTime))>,
 ) {
     let send = |path: PathBuf, w: u32, h: u32, file_size: u64, modified: SystemTime| {
@@ -112,7 +129,15 @@ fn run_loader_thread(
         AppMode::Inspiration => {
             #[cfg(windows)]
             {
-                let paths = crate::win_recent::list_recent_image_paths(INSPIRATION_RECENT_MAX);
+                let recent = crate::win_recent::list_recent_image_paths(INSPIRATION_RECENT_MAX);
+                let screenshots = image_ops::list_screenshot_paths_ordered(&screenshot_dir);
+                let mut paths: Vec<PathBuf> = recent;
+                for p in screenshots {
+                    if !paths.contains(&p) && paths.len() < INSPIRATION_RECENT_MAX {
+                        paths.push(p);
+                    }
+                }
+                paths.truncate(INSPIRATION_RECENT_MAX);
                 for path in paths {
                     let (file_size, modified) = std::fs::metadata(&path)
                         .map(|m| {
@@ -129,11 +154,26 @@ fn run_loader_thread(
             }
             #[cfg(not(windows))]
             {
-                let list = list_existing_image_paths_with_metadata(
-                    &watch_path,
-                    INSPIRATION_RECENT_MAX,
-                )
-                .unwrap_or_default();
+                let mut paths: Vec<PathBuf> =
+                    list_existing_image_paths(&watch_path).unwrap_or_default();
+                for p in image_ops::list_screenshot_paths_ordered(&screenshot_dir) {
+                    if !paths.contains(&p) && paths.len() < INSPIRATION_RECENT_MAX {
+                        paths.push(p);
+                    }
+                }
+                paths.truncate(INSPIRATION_RECENT_MAX);
+                let list = paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        std::fs::metadata(&path).ok().map(|m| {
+                            (
+                                path,
+                                m.len(),
+                                m.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 for (path, file_size, modified) in list {
                     if let Ok((w, h)) = image_ops::image_dimensions(&path) {
                         send(path, w, h, file_size, modified);
@@ -160,6 +200,8 @@ pub struct DeckRefApp {
     texture_cache: std::collections::HashMap<PathBuf, TextureHandle>,
     /// 应用根目录（如 Pictures/Ref），各模式的 watch_path 由此派生
     base_path: PathBuf,
+    /// 截图目录（Ref/Screenshots），运行时剪贴板截图自动保存到此，灵感模式会合并展示
+    screenshot_dir: PathBuf,
     /// 当前模式；切换时重建 watcher 并重载卡片
     mode: AppMode,
     /// 当前监听路径（= mode.watch_path(&base_path)），与 watcher 一致
@@ -221,6 +263,10 @@ pub struct DeckRefApp {
     loading_rx: Option<mpsc::Receiver<(PathBuf, (u32, u32), (u64, SystemTime))>>,
     /// 异步加载线程的 JoinHandle，channel 关闭后 join 回收
     loading_handle: Option<thread::JoinHandle<()>>,
+    /// 上次检测到的剪贴板图片哈希，用于避免重复保存同一张截图
+    last_clipboard_image_hash: Option<u64>,
+    /// 上次轮询剪贴板的时间（秒），用于节流
+    last_clipboard_check_time: f64,
 }
 
 impl DeckRefApp {
@@ -229,6 +275,8 @@ impl DeckRefApp {
         let mode = AppMode::Default;
         let _ = mode.ensure_dir(&base_path);
         let _ = AppMode::Inspiration.ensure_dir(&base_path); // 提前创建，便于用户直接往该目录放图
+        let screenshot_dir = base_path.join("Screenshots");
+        let _ = std::fs::create_dir_all(&screenshot_dir);
         let default_watch = mode.watch_path(&base_path);
         let watch_path = window_state::load_last_default_path()
             .filter(|p| p.is_dir())
@@ -248,6 +296,7 @@ impl DeckRefApp {
             cached_inspiration_cards: None,
             texture_cache: std::collections::HashMap::new(),
             base_path,
+            screenshot_dir,
             mode,
             watch_path: watch_path.display().to_string(),
             nav_history: vec![watch_path.clone()],
@@ -295,6 +344,8 @@ impl DeckRefApp {
             logo_texture: None,
             loading_rx: None,
             loading_handle: None,
+            last_clipboard_image_hash: None,
+            last_clipboard_check_time: 0.0,
         };
         app.start_async_load();
         Ok(app)
@@ -391,12 +442,13 @@ impl DeckRefApp {
 
         let mode = self.mode;
         let watch_path = PathBuf::from(&self.watch_path);
+        let screenshot_dir = self.screenshot_dir.clone();
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::Builder::new()
             .name("deckref-loader".into())
             .spawn(move || {
-                run_loader_thread(mode, watch_path, tx);
+                run_loader_thread(mode, watch_path, screenshot_dir, tx);
             });
 
         match handle {
@@ -614,6 +666,64 @@ impl DeckRefApp {
                 let removed = self.cards.remove(0);
                 self.texture_cache.remove(&removed.path);
             }
+        }
+    }
+
+    /// 轮询剪贴板：若检测到与上次不同的图片则保存到截图目录（screenshot-N.png），灵感模式下即时加入卡片列表。
+    fn poll_clipboard_screenshot(&mut self, ctx: &egui::Context) {
+        let t = ctx.input(|i| i.time);
+        if t - self.last_clipboard_check_time < 0.8 {
+            return;
+        }
+        self.last_clipboard_check_time = t;
+
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let img = match clipboard.get_image() {
+            Ok(d) => d,
+            Err(_) => {
+                self.last_clipboard_image_hash = None;
+                return;
+            }
+        };
+
+        let bytes = &img.bytes;
+        let mut hasher = std::hash::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let prev = self.last_clipboard_image_hash.replace(hash);
+        if prev.is_none() {
+            return;
+        }
+        if prev == Some(hash) {
+            return;
+        }
+
+        let _ = std::fs::create_dir_all(&self.screenshot_dir);
+        let path = image_ops::next_screenshot_path(&self.screenshot_dir);
+        let w = img.width.try_into().unwrap_or(0u32);
+        let h = img.height.try_into().unwrap_or(0u32);
+        if w == 0 || h == 0 {
+            return;
+        }
+        if image_ops::save_rgba_as_png(w, h, bytes, &path).is_err() {
+            return;
+        }
+
+        if self.mode == AppMode::Inspiration {
+            let intrinsic = Vec2::new(w as f32, h as f32);
+            let mut card = ImageCard::from_path(path.clone(), intrinsic);
+            card.anim_position_delta = Vec2::new(0.0, DROP_ANIM_INITIAL_OFFSET_Y);
+            card.anim_scale = DROP_ANIM_INITIAL_SCALE;
+            self.cards.push(card);
+            if self.cards.len() > INSPIRATION_RECENT_MAX {
+                let removed = self.cards.remove(0);
+                self.texture_cache.remove(&removed.path);
+            }
+            ctx.request_repaint();
         }
     }
 
@@ -932,6 +1042,9 @@ impl DeckRefApp {
         // 消费异步加载线程发来的卡片（启动或切换模式后）
         self.poll_loading_cards();
 
+        // 运行时监听到剪贴板截图：每隔约 1 秒检测一次，若剪贴板图片与上次不同则保存到 Ref/Screenshots（screenshot-N.png）并在灵感模式下即时显示
+        self.poll_clipboard_screenshot(ctx);
+
         // 快捷抓图：从浏览器或任意软件拖入窗口的图片，保存到监听目录并由 watcher 加入堆叠
         self.handle_dropped_files(ctx);
 
@@ -976,7 +1089,7 @@ impl DeckRefApp {
                     }
                     resp.on_hover_text(match m {
                         AppMode::Default => "默认模式：监听主文件夹中的图片",
-                        AppMode::Inspiration => "灵感模式：展示 Windows 最近使用的图片（最多 30 张），保存的图片会放入 Ref/Inspiration",
+                        AppMode::Inspiration => "灵感模式：展示最近使用的图片与 Ref/Screenshots 截图；运行时截屏会自动保存并显示",
                     });
                     ui.add_space(6.0);
                 }
@@ -1301,6 +1414,14 @@ impl DeckRefApp {
                     ui.label("DeckRef");
                     ui.separator();
                     if self.mode == AppMode::Default {
+                        if ui.input(|i| i.key_pressed(egui::Key::L) && (i.modifiers.ctrl || i.modifiers.mac_cmd)) {
+                            ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L));
+                            ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::L));
+                            self.address_bar_editing = true;
+                            self.address_bar_edit_text = self.watch_path.clone();
+                            self.address_bar_edit_request_focus = true;
+                        }
+
                         let can_back = self.nav_index > 0;
                         let can_forward = self.nav_index < self.nav_history.len().saturating_sub(1);
                         if ui.add_enabled(can_back, egui::Button::new(" ◀ ").frame(false)).on_hover_text("后退").clicked() {
@@ -1319,7 +1440,7 @@ impl DeckRefApp {
                             }
                             let te = egui::TextEdit::singleline(&mut self.address_bar_edit_text)
                                 .id(id)
-                                .desired_width(ui.available_width().min(400.0))
+                                .desired_width(ui.available_width().min(500.0))
                                 .font(egui::TextStyle::Body);
                             let resp = ui.add(te);
                             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1336,109 +1457,114 @@ impl DeckRefApp {
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 self.address_bar_editing = false;
                             }
+                            if resp.lost_focus() {
+                                self.address_bar_editing = false;
+                            }
                             let _ = resp;
                         } else {
                             let watch_path_buf = PathBuf::from(&self.watch_path);
                             let segments = path_breadcrumbs(&watch_path_buf);
+                            let arrow_color = ui.visuals().weak_text_color();
+
                             egui::ScrollArea::horizontal()
                                 .id_salt("addr_bar_breadcrumb")
                                 .max_height(TOP_BAR_HEIGHT - 8.0)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         for (i, (path, label)) in segments.iter().enumerate() {
-                                        let is_sentinel = path.as_os_str() == THIS_PC_SENTINEL;
-                                        let is_current = i == segments.len() - 1;
-                                        let label_str = label.to_string_lossy();
-                                        let style = if is_current {
-                                            egui::RichText::new(label_str.as_ref()).size(12.0).strong()
-                                        } else {
-                                            egui::RichText::new(label_str.as_ref()).size(12.0)
-                                        };
-                                        if is_sentinel {
-                                            #[cfg(windows)]
-                                            {
-                                                let drives = list_drives_windows();
-                                                egui::menu::menu_button(ui, style, |ui| {
-                                                    ui.set_max_width(200.0);
-                                                    ui.set_max_height(200.0);
-                                                    egui::ScrollArea::vertical().show(ui, |ui| {
-                                                        for drive in &drives {
-                                                            let name = drive.display().to_string();
-                                                            if ui.button(name.as_str()).clicked() {
-                                                                self.navigate_watch_path(drive.clone(), true);
-                                                                ui.close_menu();
-                                                            }
-                                                        }
-                                                    });
-                                                });
-                                            }
-                                            #[cfg(not(windows))]
-                                            {
-                                                ui.add(egui::Button::new(style).frame(false));
-                                            }
-                                        } else {
-                                            let btn = egui::Button::new(style).frame(false);
-                                            let resp = ui.add(btn);
-                                            if resp.clicked() && path.is_dir() {
-                                                self.navigate_watch_path(path.clone(), true);
-                                            }
-                                            if resp.hovered() && !is_current {
+                                            let is_sentinel = path.as_os_str() == THIS_PC_SENTINEL;
+                                            let is_current = i == segments.len() - 1;
+                                            let label_str = label.to_string_lossy();
+                                            let style = if is_current {
+                                                egui::RichText::new(label_str.as_ref()).size(12.0).strong()
+                                            } else {
+                                                egui::RichText::new(label_str.as_ref()).size(12.0)
+                                            };
+
+                                            let seg_btn = egui::Button::new(style).frame(true).min_size(egui::Vec2::ZERO);
+                                            let seg_resp = ui.add(seg_btn);
+                                            if seg_resp.hovered() {
                                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                             }
-                                            resp.on_hover_text(if is_current {
-                                                "当前监听目录"
-                                            } else {
-                                                "点击切换到该目录"
-                                            });
-                                        }
-                                        if i < segments.len() - 1 {
-                                            ui.add(
-                                                egui::Label::new(egui::RichText::new(" › ").color(ui.visuals().weak_text_color())).selectable(false),
-                                            );
-                                        } else if !is_sentinel {
-                                            let subdirs: Vec<PathBuf> = std::fs::read_dir(path)
-                                                .ok()
-                                                .map(|rd| {
-                                                    let mut d: Vec<PathBuf> = rd
-                                                        .filter_map(|e| e.ok())
-                                                        .filter(|e| e.path().is_dir())
-                                                        .map(|e| e.path())
-                                                        .collect();
-                                                    d.sort_by_cached_key(|p| p.file_name().unwrap_or_default().to_string_lossy().to_lowercase());
-                                                    d.truncate(80);
-                                                    d
-                                                })
-                                                .unwrap_or_default();
-                                            if !subdirs.is_empty() {
-                                                egui::menu::menu_button(ui, egui::RichText::new(" ▾ ").color(ui.visuals().weak_text_color()), |ui| {
-                                                    ui.set_max_width(220.0);
-                                                    ui.set_max_height(200.0);
-                                                    egui::ScrollArea::vertical().show(ui, |ui| {
-                                                        for subdir in &subdirs {
-                                                            let name = subdir.file_name().unwrap_or_default().to_string_lossy();
-                                                            if ui.button(name.as_ref()).clicked() {
-                                                                self.navigate_watch_path(subdir.clone(), true);
-                                                                ui.close_menu();
-                                                            }
+                                            if seg_resp.clicked() {
+                                                if is_sentinel {
+                                                    #[cfg(windows)]
+                                                    {
+                                                        let drives = list_drives_windows();
+                                                        if let Some(first) = drives.first() {
+                                                            self.navigate_watch_path(first.clone(), true);
                                                         }
+                                                    }
+                                                } else if path.is_dir() {
+                                                    self.navigate_watch_path(path.clone(), true);
+                                                }
+                                            }
+                                            seg_resp.on_hover_text(if is_current { "当前监听目录" } else { "点击切换到该目录" });
+
+                                            if is_sentinel {
+                                                #[cfg(windows)]
+                                                {
+                                                    let drives = list_drives_windows();
+                                                    egui::menu::menu_button(ui, egui::RichText::new(" › ").color(arrow_color), |ui| {
+                                                        ui.set_max_width(200.0);
+                                                        ui.set_max_height(200.0);
+                                                        egui::ScrollArea::vertical().show(ui, |ui| {
+                                                            for drive in &drives {
+                                                                let name = drive.display().to_string();
+                                                                if ui.button(name.as_str()).clicked() {
+                                                                    self.navigate_watch_path(drive.clone(), true);
+                                                                    ui.close_menu();
+                                                                }
+                                                            }
+                                                        });
                                                     });
-                                                });
+                                                }
+                                                #[cfg(not(windows))]
+                                                {
+                                                    ui.add(egui::Label::new(egui::RichText::new(" › ").color(arrow_color)).selectable(false));
+                                                }
+                                            } else {
+                                                let subdirs = list_subdirs(path, 80);
+                                                if !subdirs.is_empty() {
+                                                    egui::menu::menu_button(ui, egui::RichText::new(" › ").color(arrow_color), |ui| {
+                                                        ui.set_max_width(220.0);
+                                                        ui.set_max_height(200.0);
+                                                        egui::ScrollArea::vertical().show(ui, |ui| {
+                                                            for subdir in &subdirs {
+                                                                let name = subdir.file_name().unwrap_or_default().to_string_lossy();
+                                                                if ui.button(name.as_ref()).clicked() {
+                                                                    self.navigate_watch_path(subdir.clone(), true);
+                                                                    ui.close_menu();
+                                                                }
+                                                            }
+                                                        });
+                                                    });
+                                                } else {
+                                                    ui.add(egui::Label::new(egui::RichText::new(" › ").color(arrow_color)).selectable(false));
+                                                }
                                             }
                                         }
-                                    }
+                                    });
                                 });
-                            });
-                            let path_btn = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new("▤ 输入或粘贴路径").size(11.0).color(ui.visuals().weak_text_color())
-                                ).frame(false),
-                            );
-                            if path_btn.clicked() {
-                                self.address_bar_editing = true;
-                                self.address_bar_edit_text = self.watch_path.clone();
-                                self.address_bar_edit_request_focus = true;
+
+                            let blank_id = egui::Id::new("addr_blank");
+                            let avail = ui.available_width();
+                            if avail > 4.0 {
+                                let blank_resp = ui.allocate_ui(egui::Vec2::new(avail, TOP_BAR_HEIGHT - 8.0), |ui| {
+                                    let rect = ui.available_rect_before_wrap();
+                                    ui.interact(rect, blank_id, egui::Sense::click())
+                                });
+                                if blank_resp.inner.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                                }
+                                if blank_resp.inner.clicked() {
+                                    self.address_bar_editing = true;
+                                    self.address_bar_edit_text = self.watch_path.clone();
+                                    self.address_bar_edit_request_focus = true;
+                                }
+                                blank_resp.response.on_hover_text("点击或 Ctrl+L 输入/粘贴路径");
                             }
-                            path_btn.on_hover_text("点击后可输入或粘贴路径，Enter 确认，Esc 取消");
+
                             ui.add_space(4.0);
                             let current_path = PathBuf::from(&self.watch_path);
                             let recent = self.recent_folders.clone();

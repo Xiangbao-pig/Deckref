@@ -8,6 +8,8 @@
 
 ## 未发布
 
+- **2025-03-04** 运行时监听剪贴板截图：约每 0.8 秒检测剪贴板，若图片与上次不同则自动保存到 **Ref/Screenshots**，按 **screenshot-1.png、screenshot-2.png…** 依次命名；若当前为灵感模式，新截图立即加入堆叠并带落下动画。灵感模式合并展示 Windows 最近使用的图片与 Ref/Screenshots 中截图（按编号排序），总数上限 30。涉及：`src/image_ops.rs`（`next_screenshot_path`、`list_screenshot_paths_ordered`）、`src/app.rs`（`screenshot_dir`、`poll_clipboard_screenshot`、灵感加载合并截图目录）、`docs/INTERACTIONS.md`。
+- **2025-03-04** 地址栏面包屑 Win11 风格重构：每级路径为独立按钮，悬停有浅灰背景（frame 启用）；每级右侧 › 可展开该层级子文件夹列表（`list_subdirs`，最多 80 个），无子目录时为不可点击 ›；点击地址栏右侧空白或 Ctrl+L（Mac Cmd+L）进入编辑模式（整栏变单行输入框），Enter 确认跳转，Esc 或失焦且路径未改时恢复面包屑；移除「▤ 输入或粘贴路径」按钮。涉及：`src/app.rs`（`list_subdirs`、面包屑与空白区逻辑）、`docs/INTERACTIONS.md`。
 - **2025-03-03** 最近到访列表持久化：关闭软件时将「最近到访」的 5 个文件夹路径写入配置目录 `recent_folders.txt`（每行一路径），下次启动时从该文件加载并合并当前目录，下拉菜单中继续显示历史地址。涉及：`src/window_state.rs`（`load_recent_folders`、`save_recent_folders`）、`src/app.rs`（`new()` 中加载、`Drop` 中保存）、`docs/INTERACTIONS.md`。
 - **2025-03-03** 导航栏「最近到访」下拉：默认模式地址栏最右侧增加 ▾ 按钮，点击显示最近到访的 5 个文件夹，点击任一项快速切换；该 5 个文件夹的卡片做缓存（`recent_folder_cards`），再次点选时直接恢复、无需重新加载；新访问顶替最旧项。涉及：`src/app.rs`（`recent_folders`、`recent_folder_cards`、`push_recent_folder`、`apply_watch_path` 缓存逻辑）、`docs/INTERACTIONS.md`。
 - **2025-03-03** 地址栏支持输入/粘贴路径：默认模式下面包屑末端增加「▤ 输入或粘贴路径」，点击后进入单行编辑框，可输入或粘贴路径，Enter 确认跳转（有效目录），Esc 取消。涉及：`src/app.rs`（`address_bar_editing` / `address_bar_edit_text`）、`docs/INTERACTIONS.md`。
