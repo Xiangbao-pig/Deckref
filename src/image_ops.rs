@@ -52,15 +52,40 @@ pub fn resolve_assets_icon_path() -> Option<PathBuf> {
     None
 }
 
-/// 常见图片扩展名（与 watcher 一致），用于快捷抓图时判断是否为图片。
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"];
+/// 标准预览图片扩展名（小写）。
+pub const STANDARD_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"];
 
-/// 按扩展名判断是否为支持的图片文件。
+/// 扩展格式扩展名（image 库可解码）；开启「预览专业格式」时与标准合并使用。
+const EXTENDED_FULL: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif",
+    "tga", "ico", "dds", "avif", "exr", "hdr", "pnm", "pbm", "pgm", "ppm", "qoi", "ff", "psd",
+];
+
+/// 返回当前应使用的图片扩展名列表。`extended == true` 时包含专业/扩展格式。
+pub fn get_image_extensions(extended: bool) -> &'static [&'static str] {
+    if extended {
+        EXTENDED_FULL
+    } else {
+        STANDARD_EXTENSIONS
+    }
+}
+
+/// 常见图片扩展名（与 watcher 一致），用于快捷抓图时判断是否为图片。
+#[allow(dead_code)]
+const IMAGE_EXTENSIONS: &[&str] = STANDARD_EXTENSIONS;
+
+/// 按扩展名判断是否为支持的图片文件。`extended == true` 时包含专业格式（TGA、ICO、DDS、AVIF 等）。
+pub fn is_image_path_with(path: &Path, extended: bool) -> bool {
+    let ext = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e.to_lowercase(),
+        None => return false,
+    };
+    get_image_extensions(extended).iter().any(|s| *s == ext.as_str())
+}
+
+/// 按扩展名判断是否为支持的图片文件（仅标准格式）。
 pub fn is_image_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false)
+    is_image_path_with(path, false)
 }
 
 /// 判断 `path` 是否在 `dir` 下（同一目录或其子路径）。用于快捷抓图去重：已在监听目录的文件不再复制。
@@ -76,15 +101,44 @@ pub fn path_is_under(path: &Path, dir: &Path) -> bool {
     path.starts_with(&dir)
 }
 
-/// 从路径加载图片，自动根据扩展名推断格式。
+/// 从路径加载图片，自动根据扩展名推断格式。支持 PSD（需开启预览专业格式时才会被列入目录，此处仅解码）。
 pub fn load_image(path: &Path) -> AppResult<DynamicImage> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    if ext.as_deref() == Some("psd") {
+        return load_psd(path);
+    }
     let data = std::fs::read(path).map_err(AppError::Io)?;
     let format = ImageFormat::from_path(path).map_err(AppError::Image)?;
     image::load_from_memory_with_format(&data, format).map_err(AppError::Image)
 }
 
-/// 获取图片尺寸 (宽, 高)，不完整解码时可返回错误。
+/// 从 PSD 文件加载为 DynamicImage（RGBA）。失败时返回 AppError。
+fn load_psd(path: &Path) -> AppResult<DynamicImage> {
+    use image::ImageBuffer;
+    let data = std::fs::read(path).map_err(AppError::Io)?;
+    let psd = psd::Psd::from_bytes(&data).map_err(|e| AppError::Other(e.to_string()))?;
+    let w = psd.width();
+    let h = psd.height();
+    let rgba = psd.rgba();
+    let buf = ImageBuffer::from_raw(w, h, rgba.to_vec())
+        .ok_or_else(|| AppError::Other("PSD 图像尺寸与像素数不匹配".into()))?;
+    Ok(DynamicImage::ImageRgba8(buf))
+}
+
+/// 获取图片尺寸 (宽, 高)，不完整解码时可返回错误。支持 PSD。
 pub fn image_dimensions(path: &Path) -> AppResult<(u32, u32)> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    if ext.as_deref() == Some("psd") {
+        let data = std::fs::read(path).map_err(AppError::Io)?;
+        let psd = psd::Psd::from_bytes(&data).map_err(|e| AppError::Other(e.to_string()))?;
+        return Ok((psd.width(), psd.height()));
+    }
     image::image_dimensions(path).map_err(AppError::Image)
 }
 

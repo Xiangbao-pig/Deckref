@@ -8,6 +8,10 @@
 
 ## 未发布
 
+- **2025-03-04** 剪贴板截图仅 Shift 后保存：修复「浏览 QQ 群图片时自动保存所有群图」的 bug。改为**仅当按下 Shift 后的约 5 秒内**才把剪贴板新图当作截图保存到 Ref/Screenshots；未按 Shift 或超时后不保存，避免误存 QQ/浏览器等复制的图片。闲暇时仍会定期读剪贴板以更新内部哈希，进入监听窗口时不误存旧内容。涉及：`src/app.rs`（`shift_listening_until`、`poll_clipboard_screenshot`、`SHIFT_LISTENING_DURATION`）、`docs/INTERACTIONS.md`。
+- **2025-03-04** 右键拖动桥接系统标题栏（SendInput + 后台线程）：Windows 上右键拖动超过阈值后，先 **SendInput 注入左键按下**，再 ReleaseCapture + WM_SYSCOMMAND SC_MOVE，主线程在系统模态拖动中阻塞；**后台线程**轮询 VK_RBUTTON，一旦松开则 **SendInput 左键松开**，系统结束拖动。由系统接管移动，无抖动。涉及：`src/win_move.rs`（SendInput LEFTDOWN/LEFTUP、GetAsyncKeyState 轮询线程）、`src/app.rs`（有 hwnd 时调用桥接，返回后重置手势）、`docs/INTERACTIONS.md`。
+- **2025-03-04** 右键拖动移动窗口（桥接回退）：Windows 上桥接 SC_MOVE 在右键按下时系统不响应，导致窗口不移动；已改回始终使用每帧 OuterPosition，右键**按住并拖动**超过约 4 像素即可移动窗口。涉及：`src/app.rs`、`docs/INTERACTIONS.md`。（已被本次 SendInput 方案替代。）
+- **2025-03-04** 预览专业格式图片：设置中新增「预览专业格式图片」选项；开启后监听与加载时包含 TGA、ICO、DDS、AVIF、EXR、HDR、PNM、QOI、FF、**PSD** 等扩展名，并集成 **psd** crate 解码 PSD 为 RGBA 预览。更改该设置后会重启 watcher 并重新加载当前目录。涉及：`src/image_ops.rs`（`get_image_extensions`、`is_image_path_with`、`load_psd`、`image_dimensions` 对 PSD）、`src/watcher.rs`（`extended_formats`）、`src/win_recent.rs`、`src/settings.rs`、`src/app.rs`、`docs/SETTINGS.md`、`docs/INTERACTIONS.md`、`Cargo.toml`（psd）。
 - **2025-03-04** 运行时监听剪贴板截图：约每 0.8 秒检测剪贴板，若图片与上次不同则自动保存到 **Ref/Screenshots**，按 **screenshot-1.png、screenshot-2.png…** 依次命名；若当前为灵感模式，新截图立即加入堆叠并带落下动画。灵感模式合并展示 Windows 最近使用的图片与 Ref/Screenshots 中截图（按编号排序），总数上限 30。涉及：`src/image_ops.rs`（`next_screenshot_path`、`list_screenshot_paths_ordered`）、`src/app.rs`（`screenshot_dir`、`poll_clipboard_screenshot`、灵感加载合并截图目录）、`docs/INTERACTIONS.md`。
 - **2025-03-04** 地址栏面包屑 Win11 风格重构：每级路径为独立按钮，悬停有浅灰背景（frame 启用）；每级右侧 › 可展开该层级子文件夹列表（`list_subdirs`，最多 80 个），无子目录时为不可点击 ›；点击地址栏右侧空白或 Ctrl+L（Mac Cmd+L）进入编辑模式（整栏变单行输入框），Enter 确认跳转，Esc 或失焦且路径未改时恢复面包屑；移除「▤ 输入或粘贴路径」按钮。涉及：`src/app.rs`（`list_subdirs`、面包屑与空白区逻辑）、`docs/INTERACTIONS.md`。
 - **2025-03-03** 最近到访列表持久化：关闭软件时将「最近到访」的 5 个文件夹路径写入配置目录 `recent_folders.txt`（每行一路径），下次启动时从该文件加载并合并当前目录，下拉菜单中继续显示历史地址。涉及：`src/window_state.rs`（`load_recent_folders`、`save_recent_folders`）、`src/app.rs`（`new()` 中加载、`Drop` 中保存）、`docs/INTERACTIONS.md`。
@@ -38,4 +42,14 @@
 
 ## 已发布
 
-（此前若有版本发布，可在此按版本/时间罗列；当前仅保留「未发布」即可。）
+### [0.1.1] - 2025-03-04
+
+- **双模式**：默认 / 灵感（Windows 最近使用的文件、Ref/Inspiration）；模式切换保留缓存。
+- **地址栏**：面包屑导航（Win11 风格、子目录 ›）、最近到访（5 条持久化）、Ctrl+L 编辑路径、后退/前进；启动恢复上次文件夹。
+- **剪贴板截图**：运行时监听剪贴板，**仅 Shift 后约 5 秒内**将新图保存到 Ref/Screenshots（避免误存 QQ/浏览器）；灵感模式合并展示截图。
+- **专业格式预览**：设置中「预览专业格式图片」可开启 TGA/ICO/DDS/AVIF/EXR/HDR/PNM/QOI/FF/**PSD** 等，PSD 由 `psd` crate 解码。
+- **右键拖动移动窗口**：Windows 上右键拖动超阈值后 SendInput 桥接系统标题栏拖动，由系统接管无抖动（`src/win_move.rs`）。
+- **设置与状态**：设置持久化（反转平移、拖拽出窗口、专业格式开关）；窗口尺寸与路径恢复；配置目录 `last_path.txt` / `recent_folders.txt` / `settings.txt`。
+- **其它**：启动异步加载；拖出又拖回仅置顶；HDROP/FileContents 二选一防重复保存；Chrome/Edge OLE 拖入、Ctrl+V 粘贴；文档 `SETTINGS.md`、`AGENT_ROLES.md` 等。
+
+（此前若有版本发布，可在此按版本/时间罗列。）

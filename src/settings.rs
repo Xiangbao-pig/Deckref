@@ -12,6 +12,8 @@ pub struct AppSettings {
     pub invert_pan: bool,
     /// 拿起图片后拖出窗口边缘时是否发起系统文件拖放（默认开启）
     pub allow_drag_out: bool,
+    /// 预览专业格式图片（TGA、ICO、DDS、AVIF、EXR、HDR、PNM、QOI、PSD 等）
+    pub preview_professional_formats: bool,
 }
 
 impl Default for AppSettings {
@@ -19,6 +21,7 @@ impl Default for AppSettings {
         Self {
             invert_pan: false,
             allow_drag_out: true,
+            preview_professional_formats: false,
         }
     }
 }
@@ -48,9 +51,15 @@ pub fn load_settings() -> AppSettings {
         .and_then(|l| l.parse::<u8>().ok())
         .map(|n| n != 0)
         .unwrap_or(true);
+    let preview_professional_formats = lines
+        .next()
+        .and_then(|l| l.parse::<u8>().ok())
+        .map(|n| n != 0)
+        .unwrap_or(false);
     AppSettings {
         invert_pan,
         allow_drag_out,
+        preview_professional_formats,
     }
 }
 
@@ -61,9 +70,10 @@ pub fn save_settings(s: &AppSettings) -> AppResult<()> {
         std::fs::create_dir_all(parent).map_err(AppError::Io)?;
     }
     let content = format!(
-        "{}\n{}\n",
+        "{}\n{}\n{}\n",
         if s.invert_pan { 1 } else { 0 },
-        if s.allow_drag_out { 1 } else { 0 }
+        if s.allow_drag_out { 1 } else { 0 },
+        if s.preview_professional_formats { 1 } else { 0 }
     );
     std::fs::write(&path, content).map_err(AppError::Io)?;
     Ok(())

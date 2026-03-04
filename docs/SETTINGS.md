@@ -21,6 +21,7 @@
 |-----|---------------------|------|------|--------|------------------|
 | 1 | 反转平移方向（中键拖动） | 中键拖动时视角移动方向是否与默认相反 | 布尔 | 关（`false`） | `invert_pan`。详见 `docs/INTERACTIONS.md`「视角平移」。 |
 | 2 | 贴图拖拽出窗口 | 拿起图片后拖出窗口边缘时是否发起系统文件拖放（可拖到文件夹或其它软件） | 布尔 | 开（`true`） | `allow_drag_out`。关闭后拖出窗口仅取消拿起状态，不发起系统拖放。 |
+| 3 | 预览专业格式图片 | 开启后可预览 TGA、ICO、DDS、AVIF、EXR、HDR、PNM、QOI、PSD 等格式；更改后会重新加载当前目录 | 布尔 | 关（`false`） | `preview_professional_formats`。详见 `docs/INTERACTIONS.md`。 |
 
 ---
 
@@ -28,6 +29,7 @@
 
 - **第 1 行**：`invert_pan`，`0` 或 `1`
 - **第 2 行**：`allow_drag_out`，`0` 或 `1`
+- **第 3 行**：`preview_professional_formats`，`0` 或 `1`
 
 新增布尔设置时，在末尾追加一行；若新增非布尔类型，需在 `src/settings.rs` 中扩展格式并在此注明。
 

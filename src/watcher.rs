@@ -1,19 +1,14 @@
 //! 文件系统监听模块。与 UI 完全解耦，通过 channel 发送事件。
 
 use crate::error::{AppError, AppResult};
+use crate::image_ops;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
-/// 常见图片扩展名（小写），用于过滤“新图片”事件与启动扫描。
-pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"];
-
-/// 判断路径是否为图片文件（按扩展名）。
-fn is_image_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false)
+/// 判断路径是否为图片文件（按扩展名）。`extended` 为真时包含专业格式。
+fn is_image_path(path: &Path, extended: bool) -> bool {
+    image_ops::is_image_path_with(path, extended)
 }
 
 /// 监听产生的事件，供 UI 消费。
@@ -27,11 +22,13 @@ pub enum WatchEvent {
     Remove(PathBuf),
 }
 
-/// 配置：监听的根目录与防抖间隔。
+/// 配置：监听的根目录、防抖间隔、是否包含专业格式扩展名。
 #[derive(Clone)]
 pub struct WatcherConfig {
     pub watch_path: PathBuf,
     pub debounce_duration: Duration,
+    /// 为 true 时监听专业/扩展格式（TGA、ICO、DDS、AVIF、EXR、HDR、PNM、QOI、FF 等）。
+    pub extended_formats: bool,
 }
 
 impl Default for WatcherConfig {
@@ -39,6 +36,7 @@ impl Default for WatcherConfig {
         Self {
             watch_path: PathBuf::from("."),
             debounce_duration: Duration::from_millis(400),
+            extended_formats: false,
         }
     }
 }
@@ -51,32 +49,34 @@ pub fn run_watcher(
 ) -> AppResult<std::thread::JoinHandle<AppResult<()>>> {
     let watch_path = config.watch_path.clone();
     let debounce = config.debounce_duration;
+    let extended = config.extended_formats;
 
     let handle = std::thread::Builder::new()
         .name("deckref-watcher".into())
-        .spawn(move || run_watcher_loop(watch_path, debounce, tx))
+        .spawn(move || run_watcher_loop(watch_path, debounce, extended, tx))
         .map_err(|e| AppError::Other(e.to_string()))?;
 
     Ok(handle)
 }
 
-/// 扫描目录中已有图片路径（用于启动时加载），按修改时间新→旧排序。
-pub fn list_existing_image_paths(dir: &Path) -> AppResult<Vec<PathBuf>> {
-    let with_meta = list_existing_image_paths_with_metadata(dir, usize::MAX)?;
+/// 扫描目录中已有图片路径（用于启动时加载），按修改时间新→旧排序。`extended` 为真时包含专业格式。
+pub fn list_existing_image_paths(dir: &Path, extended: bool) -> AppResult<Vec<PathBuf>> {
+    let with_meta = list_existing_image_paths_with_metadata(dir, usize::MAX, extended)?;
     Ok(with_meta.into_iter().map(|(p, _, _)| p).collect())
 }
 
 /// 扫描目录中已有图片路径并带元数据（一次 metadata 用于排序与构造卡片），按修改时间新→旧，最多 `max` 条。
-/// 返回 `(PathBuf, file_size, modified)`，供后台线程再取 dimensions 后构造 ImageCard，避免主线程重复 IO。
+/// `extended` 为真时包含专业格式扩展名。
 pub fn list_existing_image_paths_with_metadata(
     dir: &Path,
     max: usize,
+    extended: bool,
 ) -> AppResult<Vec<(PathBuf, u64, SystemTime)>> {
     let mut entries: Vec<(PathBuf, u64, SystemTime)> = std::fs::read_dir(dir)
         .map_err(AppError::Io)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.is_file() && is_image_path(p))
+        .filter(|p| p.is_file() && is_image_path(p, extended))
         .filter_map(|p| {
             std::fs::metadata(&p)
                 .ok()
@@ -91,6 +91,7 @@ pub fn list_existing_image_paths_with_metadata(
 fn run_watcher_loop(
     watch_path: PathBuf,
     debounce_duration: Duration,
+    extended: bool,
     tx: mpsc::Sender<WatchEvent>,
 ) -> AppResult<()> {
     use notify::RecursiveMode;
@@ -112,7 +113,7 @@ fn run_watcher_loop(
         match res {
             Ok(events) => {
                 for e in events {
-                    if !is_image_path(&e.path) {
+                    if !is_image_path(&e.path, extended) {
                         continue;
                     }
                     let ev = WatchEvent::Modify(e.path);

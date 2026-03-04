@@ -41,8 +41,14 @@ const VIEW_ZOOM_SENSITIVITY: f32 = 0.0012;
 const MAX_DRAG_OUT_RECENT: usize = 20;
 /// 导航栏「最近到访」下拉中保留的文件夹数量，并为这 5 个做卡片缓存以加快切换
 const RECENT_FOLDERS_MAX: usize = 5;
+/// 右键拖动移动窗口：超过该距离（像素）才视为「移动窗口」而非右键点击，与 PureRef 的 Move window threshold 思路一致
+const RIGHT_DRAG_MOVE_THRESHOLD: f32 = 4.0;
 /// 面包屑根「此台电脑」的占位路径，不参与真实导航，仅用于展开盘符列表（Windows）
 const THIS_PC_SENTINEL: &str = "::THIS_PC::";
+/// 剪贴板截图轮询间隔（秒）：至少隔这么久才读一次剪贴板，避免过于频繁。1.0～1.5 更省资源，0.8 响应更快。
+const CLIPBOARD_POLL_INTERVAL: f64 = 0.8;
+/// 按下 Shift 后持续监听剪贴板截图的时长（秒）。手动截屏（如 Win+Shift+S）通常伴随 Shift，此时间内剪贴板新图会保存；超时后不再自动保存，避免误存 QQ/浏览器等复制的图片。
+const SHIFT_LISTENING_DURATION: f64 = 5.0;
 
 /// Windows：列出所有逻辑盘符路径（如 C:\、D:\）。
 #[cfg(windows)]
@@ -111,6 +117,7 @@ fn run_loader_thread(
     mode: AppMode,
     watch_path: PathBuf,
     screenshot_dir: PathBuf,
+    extended_formats: bool,
     tx: mpsc::Sender<(PathBuf, (u32, u32), (u64, SystemTime))>,
 ) {
     let send = |path: PathBuf, w: u32, h: u32, file_size: u64, modified: SystemTime| {
@@ -118,7 +125,7 @@ fn run_loader_thread(
     };
     match mode {
         AppMode::Default => {
-            let list = list_existing_image_paths_with_metadata(&watch_path, MAX_CARDS)
+            let list = list_existing_image_paths_with_metadata(&watch_path, MAX_CARDS, extended_formats)
                 .unwrap_or_default();
             for (path, file_size, modified) in list {
                 if let Ok((w, h)) = image_ops::image_dimensions(&path) {
@@ -129,7 +136,7 @@ fn run_loader_thread(
         AppMode::Inspiration => {
             #[cfg(windows)]
             {
-                let recent = crate::win_recent::list_recent_image_paths(INSPIRATION_RECENT_MAX);
+                let recent = crate::win_recent::list_recent_image_paths(INSPIRATION_RECENT_MAX, extended_formats);
                 let screenshots = image_ops::list_screenshot_paths_ordered(&screenshot_dir);
                 let mut paths: Vec<PathBuf> = recent;
                 for p in screenshots {
@@ -155,7 +162,7 @@ fn run_loader_thread(
             #[cfg(not(windows))]
             {
                 let mut paths: Vec<PathBuf> =
-                    list_existing_image_paths(&watch_path).unwrap_or_default();
+                    list_existing_image_paths(&watch_path, extended_formats).unwrap_or_default();
                 for p in image_ops::list_screenshot_paths_ordered(&screenshot_dir) {
                     if !paths.contains(&p) && paths.len() < INSPIRATION_RECENT_MAX {
                         paths.push(p);
@@ -239,6 +246,8 @@ pub struct DeckRefApp {
     invert_pan: bool,
     /// 拿起图片后拖出窗口边缘时是否发起系统文件拖放（可在设置中关闭，默认开启）
     allow_drag_out: bool,
+    /// 预览专业格式图片（TGA、ICO、DDS、AVIF、EXR、HDR、PNM、QOI、PSD 等）；开启后监听与加载时包含这些扩展名
+    preview_professional_formats: bool,
     /// 刚放下并正在做旋转落定动画的卡片索引；仅该卡的 anim_rotation_offset 向 0 收敛，其余保持一览/阵列设定
     recently_dropped_index: Option<usize>,
     /// 本帧或上一帧内由拖入保存的新文件路径，用于对新加入的卡片播放落下动画
@@ -267,6 +276,16 @@ pub struct DeckRefApp {
     last_clipboard_image_hash: Option<u64>,
     /// 上次轮询剪贴板的时间（秒），用于节流
     last_clipboard_check_time: f64,
+    /// 仅当「Shift 按下后的 N 秒内」才把剪贴板新图当作截图保存；超过此刻则不保存（避免误存 QQ/浏览器等复制的图）。0 表示未在监听窗口内。
+    shift_listening_until: f64,
+    /// 设置中更改「预览专业格式」后置为 true，本帧末重启 watcher 并重新加载
+    pending_reload_after_settings: bool,
+    /// 右键按下后尚未超过移动阈值的累计位移（用于阈值判断）
+    right_drag_pending_delta: egui::Vec2,
+    /// 本手势已超过阈值，正在移动窗口（Windows 上 StartDrag 仅响应左键，故用手动 OuterPosition）
+    right_drag_started: bool,
+    /// 上一帧发送的窗口位置（目标 = last_sent + delta 取整，减少累积误差）
+    right_drag_last_sent: Option<egui::Pos2>,
 }
 
 impl DeckRefApp {
@@ -281,13 +300,14 @@ impl DeckRefApp {
         let watch_path = window_state::load_last_default_path()
             .filter(|p| p.is_dir())
             .unwrap_or(default_watch);
+        let loaded = settings::load_settings();
         let (tx, rx) = mpsc::channel();
         let config = WatcherConfig {
             watch_path: watch_path.clone(),
+            extended_formats: loaded.preview_professional_formats,
             ..WatcherConfig::default()
         };
         let handle = crate::watcher::run_watcher(config, tx)?;
-        let loaded = settings::load_settings();
         let mut app = Self {
             watch_rx: rx,
             _watcher_handle: Some(handle),
@@ -330,6 +350,7 @@ impl DeckRefApp {
             settings_open: false,
             invert_pan: loaded.invert_pan,
             allow_drag_out: loaded.allow_drag_out,
+            preview_professional_formats: loaded.preview_professional_formats,
             recently_dropped_index: None,
             recent_drop_paths: HashSet::new(),
             recent_drag_out_paths: HashSet::new(),
@@ -346,6 +367,11 @@ impl DeckRefApp {
             loading_handle: None,
             last_clipboard_image_hash: None,
             last_clipboard_check_time: 0.0,
+            shift_listening_until: 0.0,
+            pending_reload_after_settings: false,
+            right_drag_pending_delta: egui::Vec2::ZERO,
+            right_drag_started: false,
+            right_drag_last_sent: None,
         };
         app.start_async_load();
         Ok(app)
@@ -368,6 +394,7 @@ impl DeckRefApp {
         let (tx, rx) = mpsc::channel();
         let config = WatcherConfig {
             watch_path: watch_path.clone(),
+            extended_formats: self.preview_professional_formats,
             ..WatcherConfig::default()
         };
         if let Ok(handle) = crate::watcher::run_watcher(config, tx) {
@@ -443,12 +470,13 @@ impl DeckRefApp {
         let mode = self.mode;
         let watch_path = PathBuf::from(&self.watch_path);
         let screenshot_dir = self.screenshot_dir.clone();
+        let extended_formats = self.preview_professional_formats;
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::Builder::new()
             .name("deckref-loader".into())
             .spawn(move || {
-                run_loader_thread(mode, watch_path, screenshot_dir, tx);
+                run_loader_thread(mode, watch_path, screenshot_dir, extended_formats, tx);
             });
 
         match handle {
@@ -503,6 +531,7 @@ impl DeckRefApp {
         let (tx, rx) = mpsc::channel();
         let config = WatcherConfig {
             watch_path: watch_path.clone(),
+            extended_formats: self.preview_professional_formats,
             ..WatcherConfig::default()
         };
         if let Ok(handle) = crate::watcher::run_watcher(config, tx) {
@@ -609,16 +638,16 @@ impl DeckRefApp {
         let paths: Vec<PathBuf> = if self.mode == AppMode::Inspiration {
             #[cfg(windows)]
             {
-                crate::win_recent::list_recent_image_paths(INSPIRATION_RECENT_MAX)
+                crate::win_recent::list_recent_image_paths(INSPIRATION_RECENT_MAX, self.preview_professional_formats)
             }
             #[cfg(not(windows))]
             {
                 let watch_path = std::path::PathBuf::from(&self.watch_path);
-                list_existing_image_paths(&watch_path).unwrap_or_default()
+                list_existing_image_paths(&watch_path, self.preview_professional_formats).unwrap_or_default()
             }
         } else {
             let watch_path = std::path::PathBuf::from(&self.watch_path);
-            match list_existing_image_paths(&watch_path) {
+            match list_existing_image_paths(&watch_path, self.preview_professional_formats) {
                 Ok(p) => p,
                 Err(_) => return,
             }
@@ -670,9 +699,14 @@ impl DeckRefApp {
     }
 
     /// 轮询剪贴板：若检测到与上次不同的图片则保存到截图目录（screenshot-N.png），灵感模式下即时加入卡片列表。
+    /// 仅当「Shift 按下后的 N 秒内」才保存，避免误存 QQ/浏览器等复制的图片；闲暇时仍会更新剪贴板哈希以便进入监听窗口时不误存旧内容。
     fn poll_clipboard_screenshot(&mut self, ctx: &egui::Context) {
         let t = ctx.input(|i| i.time);
-        if t - self.last_clipboard_check_time < 0.8 {
+        // 按下 Shift 即开启/延长「截图监听窗口」，便于 Win+Shift+S 等操作后自动保存
+        if ctx.input(|i| i.modifiers.shift) {
+            self.shift_listening_until = t + SHIFT_LISTENING_DURATION;
+        }
+        if t - self.last_clipboard_check_time < CLIPBOARD_POLL_INTERVAL {
             return;
         }
         self.last_clipboard_check_time = t;
@@ -699,6 +733,11 @@ impl DeckRefApp {
             return;
         }
         if prev == Some(hash) {
+            return;
+        }
+
+        // 仅在与「Shift 按下后的监听窗口」内才保存，否则只更新哈希、不写入磁盘
+        if t > self.shift_listening_until {
             return;
         }
 
@@ -736,7 +775,7 @@ impl DeckRefApp {
         let watch_dir = std::path::PathBuf::from(&self.watch_path);
         for file in dropped {
             let saved = if let Some(ref path) = file.path {
-                if !image_ops::is_image_path(path) {
+                if !image_ops::is_image_path_with(path, self.preview_professional_formats) {
                     None
                 } else {
                     let dropped_canon = path.canonicalize().ok();
@@ -789,7 +828,7 @@ impl DeckRefApp {
     /// 处理单条“拖入路径”（来自 Windows 原生拖放或 egui 的 path）：刚拖出又拖回则只置顶不复制；已在监听目录则置顶，否则复制并标记落下动画。
     fn handle_dropped_path(&mut self, path: PathBuf, ctx: &egui::Context) {
         let watch_dir = std::path::PathBuf::from(&self.watch_path);
-        if !image_ops::is_image_path(&path) {
+        if !image_ops::is_image_path_with(&path, self.preview_professional_formats) {
             return;
         }
         if let Ok(canon) = path.canonicalize() {
@@ -1037,12 +1076,70 @@ impl DeckRefApp {
             return;
         }
 
+        // 按住右键拖动移动窗口（参考 PureRef：超过阈值才视为移动；Windows 上有 hwnd 时桥接系统标题栏拖动，无抖动）
+        {
+            let (secondary_down, delta, outer_rect) = ctx.input(|i| {
+                (
+                    i.pointer.secondary_down(),
+                    i.pointer.delta(),
+                    i.viewport().outer_rect.map(|r| r.min),
+                )
+            });
+            if secondary_down {
+                if self.right_drag_started {
+                    // 已进入移动：Windows 桥接会阻塞直到松开，不会走到这里；非 Windows 或无 hwnd 时用手动
+                    if let Some(last) = self.right_drag_last_sent {
+                        let target = last + delta;
+                        let rounded = egui::Pos2::new(target.x.round(), target.y.round());
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(rounded));
+                        self.right_drag_last_sent = Some(rounded);
+                    }
+                } else {
+                    self.right_drag_pending_delta += delta;
+                    let dist_sq = self.right_drag_pending_delta.length_sq();
+                    if dist_sq >= RIGHT_DRAG_MOVE_THRESHOLD * RIGHT_DRAG_MOVE_THRESHOLD {
+                        self.right_drag_started = true;
+                        #[cfg(windows)]
+                        if let Some(hwnd) = self.win_drop_hwnd {
+                            crate::win_move::start_system_window_drag(hwnd);
+                            // 桥接返回后手势已结束，重置以便下次右键拖动
+                            self.right_drag_pending_delta = egui::Vec2::ZERO;
+                            self.right_drag_started = false;
+                            self.right_drag_last_sent = None;
+                        } else {
+                            if let Some(pos) = outer_rect {
+                                let target = pos + self.right_drag_pending_delta;
+                                let rounded = egui::Pos2::new(target.x.round(), target.y.round());
+                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(rounded));
+                                self.right_drag_last_sent = Some(rounded);
+                            }
+                            self.right_drag_pending_delta = egui::Vec2::ZERO;
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            if let Some(pos) = outer_rect {
+                                let target = pos + self.right_drag_pending_delta;
+                                let rounded = egui::Pos2::new(target.x.round(), target.y.round());
+                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(rounded));
+                                self.right_drag_last_sent = Some(rounded);
+                            }
+                            self.right_drag_pending_delta = egui::Vec2::ZERO;
+                        }
+                    }
+                }
+            } else {
+                self.right_drag_pending_delta = egui::Vec2::ZERO;
+                self.right_drag_started = false;
+                self.right_drag_last_sent = None;
+            }
+        }
+
         self.poll_watch_events();
 
         // 消费异步加载线程发来的卡片（启动或切换模式后）
         self.poll_loading_cards();
 
-        // 运行时监听到剪贴板截图：每隔约 1 秒检测一次，若剪贴板图片与上次不同则保存到 Ref/Screenshots（screenshot-N.png）并在灵感模式下即时显示
+        // 运行时监听到剪贴板截图：仅当「按下 Shift 后的约 5 秒内」且剪贴板图片与上次不同时，保存到 Ref/Screenshots（screenshot-N.png），灵感模式下即时显示；否则不保存，避免误存 QQ/浏览器等复制的图
         self.poll_clipboard_screenshot(ctx);
 
         // 快捷抓图：从浏览器或任意软件拖入窗口的图片，保存到监听目录并由 watcher 加入堆叠
@@ -1089,7 +1186,7 @@ impl DeckRefApp {
                     }
                     resp.on_hover_text(match m {
                         AppMode::Default => "默认模式：监听主文件夹中的图片",
-                        AppMode::Inspiration => "灵感模式：展示最近使用的图片与 Ref/Screenshots 截图；运行时截屏会自动保存并显示",
+                        AppMode::Inspiration => "灵感模式：展示最近使用的图片与 Ref/Screenshots 截图；按下 Shift 后约 5 秒内截屏会自动保存并显示",
                     });
                     ui.add_space(6.0);
                 }
@@ -1697,14 +1794,30 @@ impl DeckRefApp {
                 {
                     changed = true;
                 }
+                if ui
+                    .checkbox(
+                        &mut self.preview_professional_formats,
+                        "预览专业格式图片",
+                    )
+                    .on_hover_text("开启后可预览 TGA、ICO、DDS、AVIF、EXR、HDR、PNM、QOI、PSD 等格式；更改后会重新加载当前目录")
+                    .changed()
+                {
+                    changed = true;
+                }
                 if changed {
                     let s = settings::AppSettings {
                         invert_pan: self.invert_pan,
                         allow_drag_out: self.allow_drag_out,
+                        preview_professional_formats: self.preview_professional_formats,
                     };
                     let _ = settings::save_settings(&s);
+                    self.pending_reload_after_settings = true;
                 }
             });
+        if self.pending_reload_after_settings {
+            self.pending_reload_after_settings = false;
+            self.apply_watch_path(std::path::PathBuf::from(&self.watch_path));
+        }
 
         // 长按拿起后指针离开窗口边缘：若允许则发起系统文件拖放；否则仅取消拿起状态。两种情况下都清除拿起/拖出状态。
         let screen_rect = ctx.screen_rect();

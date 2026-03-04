@@ -18,6 +18,7 @@
 | `docs/WORKFLOW.md` | 开发流程、留痕规范、多 Agent 协作方式。 |
 | `docs/GITHUB_SUBMISSION.md` | **提交到 GitHub 的 Agent**：推送前预审、代码安全、强制流程，执行 push 前必读。 |
 | `docs/TESTING.md` | 测试约定与 Cursor 用法：如何跑测试、写测试、提交前必跑。 |
+| `docs/AGENT_ROLES.md` | **各角色记忆**：7 个专项角色的职责、涉及模块、近期完成。新对话指定角色时让 Agent 先读对应小节 + CHANGELOG。 |
 
 **可选参考**（不参与开发约束）：`docs/VISION.md` — 项目愿景与产品方向，仅在做产品/交互取舍时参考，不以之为硬性规范。
 
@@ -38,6 +39,12 @@
 
 - **美术效果**（视觉效果、渲染、阴影、动画等）在分支 **`feature/art-effects`** 上开发；相关 Agent 或开发者在做该类改动时请先切换到该分支再改，合并前需通过预审（见 `docs/GITHUB_SUBMISSION.md`）。
 - 主分支（如 `main`）用于稳定/已合并功能；其它专项分支可按需在本文档或 `docs/WORKFLOW.md` 中补充说明。
+
+## 角色记忆（长时间开发后接上上下文）
+
+- 7 个专项角色（基础功能开发者、代码提交者、代码性能优化者、项目设置键专项设计者、易用性功能开发者、平面美术开发者、测试工程师）的「职责 + 近期做过什么」写在 **`docs/AGENT_ROLES.md`**。
+- 新开对话并指定「你是 XXX 角色」时，在首条消息中让 Agent **先看 @docs/AGENT_ROLES.md 里该角色小节和 @CHANGELOG.md 最近几条**，即可加载该角色的「记忆」。
+- 该角色完成功能后，除更新 CHANGELOG 与相关 doc 外，在 AGENT_ROLES.md 对应角色的「近期完成」中补一行或引用 CHANGELOG。详见 `docs/AGENT_ROLES.md` 第四节。
 
 ---
 

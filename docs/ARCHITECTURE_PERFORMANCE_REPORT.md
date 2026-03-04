@@ -93,7 +93,12 @@ update() → run_ui(ctx, frame)
   `image_dimensions(&path)` + `ImageCard::from_path(path, display_size)`，然后 push 到 `cards`；超过 `MAX_CARDS` 则移除首项并删对应 texture。
 - 新增卡片的 IO 与 `from_path` 的 metadata 读取都在主线程，批量事件时会有短时尖峰。
 
----
+### 2.5 剪贴板截图轮询（poll_clipboard_screenshot）
+
+- **频率**：每帧都会调用 `poll_clipboard_screenshot`，但内部按 `CLIPBOARD_POLL_INTERVAL`（当前 0.8 秒）节流，**实际读取剪贴板**最多约 1.25 次/秒。
+- **主线程**：`arboard::Clipboard::new()` 与 `get_image()` 均在主线程执行；若系统剪贴板 API 偶发阻塞（如其他进程正在写入），可能造成单次数毫秒～数十毫秒的卡顿，但仅每 0.8s 一次。
+- **单次成本**：读剪贴板 → 对图片字节做哈希（用于去重）→ 若为新图则创建目录、保存 PNG。大图（如 4K 截图）时哈希为单次遍历，量级在数毫秒内；保存文件仅在「检测到新图」时发生。
+- **结论**：0.8s 间隔在常见「剪贴板监控」应用中属于中等频率（不少产品用 0.5～2s）。对绝大多数用户性能影响可接受；若在低端机或希望更省资源，可将 `CLIPBOARD_POLL_INTERVAL` 调大至 1.0～1.5。
 
 ## 三、性能关键节点归纳（仅标注，不优化）
 
@@ -102,6 +107,7 @@ update() → run_ui(ctx, frame)
 1. **主线程阻塞**
    - ~~启动：`load_existing_images` 中目录扫描 + 每文件多次 metadata/dimensions，全部在主线程。~~ **已优化**：启动改为 `start_async_load` + 后台线程 + `poll_loading_cards` 消费。
    - 每帧：所有 UI、命中检测、动画、纹理未命中时的解码、绘制，均在同一线程。
+   - 剪贴板：每 `CLIPBOARD_POLL_INTERVAL`（0.8s）在主线程读一次剪贴板并哈希；偶发系统 API 阻塞时可能短时卡顿，频率已节流。
 
 2. **纹理与图片**
    - 纹理为**原图**解码，显示尺寸由 `effective_display_size` 缩小，存在「大图小显」的显存与解码成本。

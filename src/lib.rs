@@ -13,6 +13,9 @@ pub mod window_state;
 pub mod win_drop;
 
 #[cfg(windows)]
+pub mod win_move;
+
+#[cfg(windows)]
 pub mod win_recent;
 
 pub use app::DeckRefApp;
