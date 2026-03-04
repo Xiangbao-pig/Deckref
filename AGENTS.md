@@ -34,6 +34,8 @@
 - 应用状态与主循环：`src/app.rs`
 - 文件监听：`src/watcher.rs`
 - 图像加载/尺寸：`src/image_ops.rs`
+- **Mac 构建与打包**：`docs/BUILD_MAC.md`、`scripts/build_mac.sh`
+- **Windows 构建与打包**：`docs/BUILD_WINDOWS.md`、`scripts/build_windows.ps1`（产物：`ANzhuang/`）
 
 ## 分支约定
 

@@ -115,6 +115,28 @@ pub fn load_image(path: &Path) -> AppResult<DynamicImage> {
     image::load_from_memory_with_format(&data, format).map_err(AppError::Image)
 }
 
+/// 当原图最长边超过此值时，使用缩略图加载以节省内存与解码时间（2K 屏上仍显示为高清）。
+pub const THUMBNAIL_RESOLUTION_THRESHOLD: u32 = 2048;
+
+/// 缩略图最长边像素数，保证在 2K（2560×1440）屏上堆叠预览仍清晰。
+pub const THUMBNAIL_MAX_LONGEST_EDGE: u32 = 1200;
+
+/// 加载图片并缩放到最长边不超过 `max_longest_edge` 的缩略图；若原图已更小则不缩放。
+/// 用于高分辨率大图（如单反 50MB）的堆叠预览，在保证 2K 屏清晰的前提下显著降低解码与显存占用。
+pub fn load_image_thumbnail(path: &Path, max_longest_edge: u32) -> AppResult<DynamicImage> {
+    use image::imageops::FilterType;
+    let img = load_image(path)?;
+    let (w, h) = (img.width(), img.height());
+    let longest = w.max(h);
+    if longest <= max_longest_edge || longest == 0 {
+        return Ok(img);
+    }
+    let scale = max_longest_edge as f64 / longest as f64;
+    let nw = (w as f64 * scale).round().max(1.0) as u32;
+    let nh = (h as f64 * scale).round().max(1.0) as u32;
+    Ok(img.resize_exact(nw, nh, FilterType::CatmullRom))
+}
+
 /// 从 PSD 文件加载为 DynamicImage（RGBA）。失败时返回 AppError。
 fn load_psd(path: &Path) -> AppResult<DynamicImage> {
     use image::ImageBuffer;

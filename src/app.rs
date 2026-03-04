@@ -41,6 +41,8 @@ const VIEW_ZOOM_SENSITIVITY: f32 = 0.0012;
 const MAX_DRAG_OUT_RECENT: usize = 20;
 /// 导航栏「最近到访」下拉中保留的文件夹数量，并为这 5 个做卡片缓存以加快切换
 const RECENT_FOLDERS_MAX: usize = 5;
+/// 纹理缓存最多保留的文件夹数量；超过后淘汰最久未访问的文件夹下全部纹理，控制显存与内存占用。
+const MAX_TEXTURE_CACHE_FOLDERS: usize = 10;
 /// 右键拖动移动窗口：超过该距离（像素）才视为「移动窗口」而非右键点击，与 PureRef 的 Move window threshold 思路一致
 const RIGHT_DRAG_MOVE_THRESHOLD: f32 = 4.0;
 /// 面包屑根「此台电脑」的占位路径，不参与真实导航，仅用于展开盘符列表（Windows）
@@ -205,6 +207,8 @@ pub struct DeckRefApp {
     cached_default_cards: Option<Vec<ImageCard>>,
     cached_inspiration_cards: Option<Vec<ImageCard>>,
     texture_cache: std::collections::HashMap<PathBuf, TextureHandle>,
+    /// 纹理缓存对应的文件夹路径（按最近使用顺序，前新后旧）；超过 MAX_TEXTURE_CACHE_FOLDERS 时淘汰最旧文件夹的全部纹理。
+    texture_cache_scope: Vec<PathBuf>,
     /// 应用根目录（如 Pictures/Ref），各模式的 watch_path 由此派生
     base_path: PathBuf,
     /// 截图目录（Ref/Screenshots），运行时剪贴板截图自动保存到此，灵感模式会合并展示
@@ -315,6 +319,7 @@ impl DeckRefApp {
             cached_default_cards: None,
             cached_inspiration_cards: None,
             texture_cache: std::collections::HashMap::new(),
+            texture_cache_scope: Vec::new(),
             base_path,
             screenshot_dir,
             mode,
@@ -556,6 +561,7 @@ impl DeckRefApp {
         } else {
             self.cards.clear();
             self.texture_cache.clear();
+            self.texture_cache_scope.clear();
             if let Some(rx) = self.loading_rx.take() {
                 drop(rx);
             }
@@ -888,17 +894,34 @@ impl DeckRefApp {
     }
 
     /// 确保纹理已加载；若失败则返回 None，不 panic。
+    /// 当图片最长边超过 THUMBNAIL_RESOLUTION_THRESHOLD 时加载缩略图（最长边 THUMBNAIL_MAX_LONGEST_EDGE），保证 2K 屏清晰且节省内存与解码时间。
     fn ensure_texture(&mut self, ctx: &egui::Context, path: &PathBuf) -> Option<&TextureHandle> {
         if self.texture_cache.contains_key(path) {
             return self.texture_cache.get(path);
         }
-        let img = image_ops::load_image(path).ok()?;
+        let img = match image_ops::image_dimensions(path) {
+            Ok((w, h)) if w.max(h) > image_ops::THUMBNAIL_RESOLUTION_THRESHOLD => {
+                image_ops::load_image_thumbnail(path, image_ops::THUMBNAIL_MAX_LONGEST_EDGE).ok()
+            }
+            _ => image_ops::load_image(path).ok(),
+        }?;
         let size = [img.width() as usize, img.height() as usize];
         let rgba = img.to_rgba8();
         let color_image = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
         let name = path.to_string_lossy().to_string();
         let handle = ctx.load_texture(name, color_image, Default::default());
         self.texture_cache.insert(path.clone(), handle);
+        // 按文件夹限定纹理缓存：仅保留最近 MAX_TEXTURE_CACHE_FOLDERS 个文件夹的纹理，超出则淘汰最久未用的文件夹
+        if let Some(folder) = path.parent() {
+            let folder = folder.to_path_buf();
+            self.texture_cache_scope.retain(|p| p != &folder);
+            self.texture_cache_scope.insert(0, folder.clone());
+            while self.texture_cache_scope.len() > MAX_TEXTURE_CACHE_FOLDERS {
+                if let Some(old) = self.texture_cache_scope.pop() {
+                    self.texture_cache.retain(|k, _| !k.starts_with(&old));
+                }
+            }
+        }
         self.texture_cache.get(path)
     }
 
@@ -1711,6 +1734,7 @@ impl DeckRefApp {
                     if ui.button("清空").clicked() {
                         self.cards.clear();
                         self.texture_cache.clear();
+                        self.texture_cache_scope.clear();
                     }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),

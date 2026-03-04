@@ -1,6 +1,6 @@
 # DeckRef
 
-**当前版本 0.1.1** — Rust 桌面应用：图片堆叠浏览与快捷抓图（eframe + egui + 文件监听）。
+**当前版本 0.1.2** — Rust 桌面应用：图片堆叠浏览与快捷抓图（eframe + egui + 文件监听）。
 
 - **监听目录**：指定文件夹，新放入的图片自动加入堆叠。
 - **双模式**：**默认**（自选监听路径）与 **灵感**（Windows 下展示「最近使用的文件」中的图片，保存到 `Pictures/Ref/Inspiration`）；切换时保留另一模式缓存，不重扫磁盘。
@@ -29,6 +29,8 @@ cargo run --release
 | [docs/SETTINGS.md](docs/SETTINGS.md) | 设置项说明与存储约定 |
 | [docs/WORKFLOW.md](docs/WORKFLOW.md) | Agent 协作与开发流程 |
 | [docs/AGENT_ROLES.md](docs/AGENT_ROLES.md) | Agent 角色与职责约定 |
+| [docs/BUILD_WINDOWS.md](docs/BUILD_WINDOWS.md) | Windows 打包与分发 |
+| [docs/BUILD_MAC.md](docs/BUILD_MAC.md) | macOS 运行与打包 |
 | [AGENTS.md](AGENTS.md) | Agent 使用约定 |
 
 ## 今日开发进展（2025-03-03）

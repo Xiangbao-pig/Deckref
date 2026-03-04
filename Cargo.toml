@@ -1,6 +1,6 @@
 [package]
 name = "deckref"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "DeckRef - Rust 桌面应用 (eframe + notify + image)"
 

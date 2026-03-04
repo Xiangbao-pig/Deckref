@@ -1,5 +1,6 @@
 # Rust
 /target
+/ANzhuang
 **/*.rs.bk
 
 # 环境与敏感信息（切勿提交）

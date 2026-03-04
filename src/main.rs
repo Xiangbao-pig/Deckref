@@ -106,27 +106,86 @@ fn resolve_pictures_ref_dir() -> Result<PathBuf, AppError> {
 fn configure_cjk_fonts(cc: &eframe::CreationContext<'_>) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // Windows: 微软雅黑 / 宋体
-    let font_paths = [
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\msyhbd.ttc",
-        "C:\\Windows\\Fonts\\simsun.ttc",
-    ];
-    for path in font_paths {
-        if let Ok(data) = std::fs::read(path) {
-            let font = egui::FontData::from_owned(data);
-            fonts.font_data.insert("cjk".to_string(), font);
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "cjk".to_string());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .insert(0, "cjk".to_string());
-            break;
+    #[cfg(windows)]
+    {
+        let font_paths = [
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\msyhbd.ttc",
+            "C:\\Windows\\Fonts\\simsun.ttc",
+        ];
+        for path in font_paths {
+            if let Ok(data) = std::fs::read(path) {
+                let font = egui::FontData::from_owned(data);
+                fonts.font_data.insert("cjk".to_string(), font);
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "cjk".to_string());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .insert(0, "cjk".to_string());
+                break;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 系统自带中文字体：苹方、华文黑体、宋体-简 等
+        let font_paths = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Supplemental/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/Supplemental/Songti.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+        ];
+        for path in font_paths {
+            if let Ok(data) = std::fs::read(path) {
+                let font = egui::FontData::from_owned(data);
+                fonts.font_data.insert("cjk".to_string(), font);
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "cjk".to_string());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .insert(0, "cjk".to_string());
+                break;
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Linux 等：常见系统字体目录
+        let font_paths = [
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/fonts-chinese/uming.ttc",
+        ];
+        for path in font_paths {
+            if let Ok(data) = std::fs::read(path) {
+                let font = egui::FontData::from_owned(data);
+                fonts.font_data.insert("cjk".to_string(), font);
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "cjk".to_string());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .insert(0, "cjk".to_string());
+                break;
+            }
         }
     }
 

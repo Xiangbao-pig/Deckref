@@ -8,6 +8,11 @@
 
 ## 未发布
 
+- **2025-03-05** 纹理缓存清理：仅保留最近 **10 个文件夹**的图片纹理缓存，超过后自动淘汰最久未访问的文件夹下全部纹理，控制显存与内存；切换至未缓存文件夹或点击「清空」时清空缓存与作用域。涉及：`src/app.rs`（`texture_cache_scope`、`MAX_TEXTURE_CACHE_FOLDERS`、`ensure_texture` 按文件夹加入/淘汰、`apply_watch_path`/清空时清 scope）、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+- **2025-03-05** 高分辨率图缩略图加载：当图片最长边 > 2048px 时，堆叠预览使用缩略图（最长边 1200px、CatmullRom 缩放）而非原图，在 2K 屏上仍保持清晰的同时显著降低解码时间与显存占用（适合单反/50MB 级大图）。涉及：`src/image_ops.rs`（`load_image_thumbnail`、`THUMBNAIL_RESOLUTION_THRESHOLD`、`THUMBNAIL_MAX_LONGEST_EDGE`）、`src/app.rs`（`ensure_texture`）、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+- **2025-03-05** Windows 打包：新增卸载程序与配置说明。ANzhuang 内增加 **卸载.bat**（可选删除 %APPDATA%\DeckRef 后提示手动删除安装文件夹）、**config_readme.txt**（环境与配置说明：无需 .env、配置目录为 DeckRef）；修正使用说明与文档中配置路径为 `%APPDATA%\DeckRef`。涉及：`scripts/uninstall_win.bat`、`scripts/config_readme_win.txt`、`scripts/install_readme_win.txt`、`scripts/build_windows.ps1`、`docs/BUILD_WINDOWS.md`。
+- **2025-03-05** Windows 打包：新增 `scripts/build_windows.ps1` 与 `docs/BUILD_WINDOWS.md`，一键将 release 版 `deckref.exe` 及可选 `assets`、使用说明放入 **ANzhuang** 文件夹，便于在 Windows 上安全分发与运行（版本 0.1.1）。涉及：`scripts/build_windows.ps1`、`scripts/install_readme_win.txt`、`docs/BUILD_WINDOWS.md`。
+- **2025-03-04** macOS 支持与打包：评估并确认基本功能可在 Mac 上运行；在 `main.rs` 中为 macOS/Linux 增加 CJK 字体路径（苹方、华文黑体等），Windows 保持原有字体。新增 `scripts/build_mac.sh` 在 Mac 本机一键打出 `DeckRef.app` 并打包为 `DeckRef-mac.zip`，朋友解压后双击即可运行。新增 `docs/BUILD_MAC.md` 说明 Mac 运行评估与打包步骤。涉及：`src/main.rs`、`scripts/build_mac.sh`、`docs/BUILD_MAC.md`。
 - **2025-03-04** 剪贴板截图仅 Shift 后保存：修复「浏览 QQ 群图片时自动保存所有群图」的 bug。改为**仅当按下 Shift 后的约 5 秒内**才把剪贴板新图当作截图保存到 Ref/Screenshots；未按 Shift 或超时后不保存，避免误存 QQ/浏览器等复制的图片。闲暇时仍会定期读剪贴板以更新内部哈希，进入监听窗口时不误存旧内容。涉及：`src/app.rs`（`shift_listening_until`、`poll_clipboard_screenshot`、`SHIFT_LISTENING_DURATION`）、`docs/INTERACTIONS.md`。
 - **2025-03-04** 右键拖动桥接系统标题栏（SendInput + 后台线程）：Windows 上右键拖动超过阈值后，先 **SendInput 注入左键按下**，再 ReleaseCapture + WM_SYSCOMMAND SC_MOVE，主线程在系统模态拖动中阻塞；**后台线程**轮询 VK_RBUTTON，一旦松开则 **SendInput 左键松开**，系统结束拖动。由系统接管移动，无抖动。涉及：`src/win_move.rs`（SendInput LEFTDOWN/LEFTUP、GetAsyncKeyState 轮询线程）、`src/app.rs`（有 hwnd 时调用桥接，返回后重置手势）、`docs/INTERACTIONS.md`。
 - **2025-03-04** 右键拖动移动窗口（桥接回退）：Windows 上桥接 SC_MOVE 在右键按下时系统不响应，导致窗口不移动；已改回始终使用每帧 OuterPosition，右键**按住并拖动**超过约 4 像素即可移动窗口。涉及：`src/app.rs`、`docs/INTERACTIONS.md`。（已被本次 SendInput 方案替代。）
@@ -41,6 +46,15 @@
 ---
 
 ## 已发布
+
+### [0.1.2] - 2025-03-05
+
+- **纹理缓存**：仅保留最近 10 个文件夹的图片纹理，超过后自动淘汰最久未访问的文件夹，控制显存与内存。
+- **大图缩略图**：最长边 > 2048px 的图片堆叠预览使用缩略图（最长边 1200px），降低解码时间与显存，适合单反/大图。
+- **Windows 打包**：`scripts/build_windows.ps1` 一键产出 ANzhuang 文件夹；新增卸载脚本与配置说明（`%APPDATA%\DeckRef`）；见 `docs/BUILD_WINDOWS.md`。
+- **macOS 支持与打包**：main 中为 macOS/Linux 增加 CJK 字体路径；`scripts/build_mac.sh` 打出 `DeckRef.app` 并打包为 zip；见 `docs/BUILD_MAC.md`。
+
+（此前若有版本发布，可在此按版本/时间罗列。）
 
 ### [0.1.1] - 2025-03-04
 

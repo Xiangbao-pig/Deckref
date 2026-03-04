@@ -78,13 +78,10 @@ update() → run_ui(ctx, frame)
 
 ### 2.3 纹理加载（ensure_texture）
 
-- 使用 `HashMap<PathBuf, TextureHandle>` 作为纹理缓存，无独立容量上限；卡片数受 `MAX_CARDS` 限制，超出时从 `cards` 移除并从 cache 删对应项。
-- 逻辑：若 cache 中无该 path，则  
-  `image_ops::load_image(path)` → `std::fs::read(path)` + `image::load_from_memory_with_format(...)`，  
-  再 `ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())`，  
-  最后 `ctx.load_texture(...)` 并插入 cache。
-- **load_image** 是完整解码为 RGBA，无缩略图或分级分辨率；大图会带来主线程解码耗时和显存占用。
-- **每帧**对当前所有卡片的 path 调用 `ensure_texture`，未命中时才解码；首帧或新加入卡片时，多张同时未命中会导致多张图在主线程顺序解码。
+- 使用 `HashMap<PathBuf, TextureHandle>` 作为纹理缓存；**清理模式**：仅保留最近 **MAX_TEXTURE_CACHE_FOLDERS（10）个文件夹**的纹理，按「最近使用」顺序维护 `texture_cache_scope`，超过时淘汰最久未访问的文件夹下全部纹理，控制显存与内存。切换至未缓存文件夹或点击「清空」时清空 cache 与 scope。
+- 逻辑：若 cache 中无该 path，则先 `image_ops::image_dimensions(path)` 判断尺寸；若**最长边 > THUMBNAIL_RESOLUTION_THRESHOLD（2048）**则调用 `load_image_thumbnail(path, THUMBNAIL_MAX_LONGEST_EDGE)`（解码后缩放到最长边 1200px，CatmullRom），否则 `load_image(path)` 原图；再 `ColorImage::from_rgba_unmultiplied(...)`、`ctx.load_texture(...)` 并插入 cache；插入后将该 path 所在文件夹加入 scope 前端，若 scope 超过 10 则弹出最旧文件夹并 evict 其下全部纹理。
+- **缩略图**：高分辨率大图（如单反 50MB）在堆叠预览时只加载 1200px 最长边的缩略图，保证 2K 屏清晰且降低解码与显存；原图仍用于布局尺寸（intrinsic_size 来自启动时 dimensions）。
+- **每帧**对当前所有卡片的 path 调用 `ensure_texture`，未命中时才解码；首帧或新加入卡片时，多张同时未命中会在主线程顺序解码（但每张若为超大图则只解码缩略图）。
 
 ### 2.4 文件监听与新增卡片
 
@@ -110,8 +107,8 @@ update() → run_ui(ctx, frame)
    - 剪贴板：每 `CLIPBOARD_POLL_INTERVAL`（0.8s）在主线程读一次剪贴板并哈希；偶发系统 API 阻塞时可能短时卡顿，频率已节流。
 
 2. **纹理与图片**
-   - 纹理为**原图**解码，显示尺寸由 `effective_display_size` 缩小，存在「大图小显」的显存与解码成本。
-   - 无缩略图或按需分辨率；首展或批量加入时，多张未命中会在主线程顺序解码。
+   - ~~纹理为**原图**解码，显示尺寸由 `effective_display_size` 缩小，存在「大图小显」的显存与解码成本。~~ **已优化**：最长边 > 2048px 的图在 `ensure_texture` 时加载缩略图（最长边 1200px），2K 屏上仍清晰，解码与显存显著降低。
+   - 首展或批量加入时，多张未命中会在主线程顺序解码（超大图仅解码缩略图）。
 
 3. **每帧分配与 work**
    - `paths: Vec<PathBuf> = self.cards.iter().map(|c| c.path.clone()).collect()` 每帧分配。
@@ -135,6 +132,7 @@ update() → run_ui(ctx, frame)
 ## 四、资源与规模假设（便于后续优化决策）
 
 - **MAX_CARDS** = 80，当前单列表、单 cache 规模固定。
+- **MAX_TEXTURE_CACHE_FOLDERS** = 10，纹理缓存仅保留最近 10 个文件夹的纹理，超出后按「最久未访问」淘汰整文件夹，避免跨文件夹无限累积。
 - **防抖** = 400ms，监听侧已做合并。
 - **无异步运行时**：启动阶段已通过独立加载线程 + mpsc 移出主线程；若未来将纹理解码等移出主线程，可继续用 spawn + channel 或引入轻量线程池。
 - **egui**：即时模式、每帧重算 UI，纹理通过 ctx 管理；大纹理数量与尺寸会直接影响显存与上传成本。
