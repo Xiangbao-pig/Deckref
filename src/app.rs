@@ -1125,46 +1125,104 @@ impl DeckRefApp {
         self.view_offset = egui::Vec2::ZERO;
     }
 
-    /// 阵列排列：将图片按网格、原比例（contain）排列，单次触发；之后仍可自由拖动、拿起等。
+    /// 阵列排列：按原比例无缝紧密排列（类似股市热力图），行内无缝隙、行间无缝隙，填满可用区域。
     fn grid_arrange(&mut self) {
         let n = self.cards.len();
         if n == 0 {
             return;
         }
         let size = self.stack_layout.available_size;
-        let pad = 48.0;
+        let pad = 4.0;
         let inner_w = (size.x - pad * 2.0).max(100.0);
         let inner_h = (size.y - pad * 2.0).max(100.0);
-        let cols = (n as f32).sqrt().ceil().max(1.0) as usize;
-        let rows = (n as f32 / cols as f32).ceil().max(1.0) as usize;
-        let cell_w = inner_w / cols as f32;
-        let cell_h = inner_h / rows as f32;
         let half_w = inner_w * 0.5;
         let half_h = inner_h * 0.5;
-        for (i, card) in self.cards.iter_mut().enumerate() {
-            let r = i / cols;
-            let c = i % cols;
-            let grid_center = egui::Vec2::new(
-                -half_w + (c as f32 + 0.5) * cell_w,
-                -half_h + (r as f32 + 0.5) * cell_h,
-            );
-            let (layout_pos, layout_rot) = self.stack_layout.position_and_rotation(i, n);
-            let layout_pos = layout_pos.to_vec2();
-            let new_offset = grid_center - layout_pos;
-            card.anim_position_delta = card.random_offset - new_offset;
-            card.random_offset = new_offset;
-            card.anim_rotation_offset = 0.0;
-            card.random_rotation = -layout_rot;
-            let iw = card.intrinsic_size.x.max(1.0);
-            let ih = card.intrinsic_size.y.max(1.0);
-            let contain_scale = (cell_w / iw).min(cell_h / ih);
-            let contain_size = egui::Vec2::new(iw * contain_scale, ih * contain_scale);
-            let effective = self.stack_layout.effective_display_size(card.intrinsic_size, i, n);
-            let eff_x = effective.x.max(1e-6);
-            let eff_y = effective.y.max(1e-6);
-            let display_scale = (contain_size.x / eff_x).min(contain_size.y / eff_y);
-            card.display_scale = display_scale.clamp(DISPLAY_SCALE_MIN, DISPLAY_SCALE_MAX);
+
+        // 每张图的原比例 aspect = w/h
+        let aspects: Vec<f32> = self
+            .cards
+            .iter()
+            .map(|c| {
+                let (iw, ih) = (c.intrinsic_size.x.max(1.0), c.intrinsic_size.y.max(1.0));
+                iw / ih
+            })
+            .collect();
+        let total_aspect: f32 = aspects.iter().sum();
+
+        if total_aspect <= 0.0 {
+            return;
         }
+
+        // 估计行数：总高度 ≈ inner_h => R ≈ sqrt(inner_h * S / inner_w)
+        let r_f = (inner_h * total_aspect / inner_w).sqrt().max(1.0);
+        let num_rows = r_f.ceil().min(n as f32).max(1.0) as usize;
+        let target_sum_per_row = total_aspect / num_rows as f32;
+
+        // 贪心分行：每行 sum(aspect) 尽量接近 target，最后一行收尾到 n
+        let mut row_starts = vec![0usize];
+        let mut row_sum = 0.0f32;
+        for i in 0..n {
+            let a = aspects[i];
+            if row_starts.len() < num_rows
+                && row_sum >= target_sum_per_row * 0.5
+                && (row_sum + a > target_sum_per_row * 1.2 || row_starts.len() == num_rows - 1)
+            {
+                row_starts.push(i);
+                row_sum = 0.0;
+            }
+            row_sum += a;
+        }
+        if row_starts.last().copied().unwrap_or(0) < n {
+            row_starts.push(n);
+        }
+        let num_rows_actual = (row_starts.len() - 1).max(1);
+        let row_boundaries = &row_starts[..];
+
+        // 每行高度（未缩放）：row_height = inner_w / sum(aspect in row)
+        let mut row_heights: Vec<f32> = Vec::with_capacity(num_rows_actual);
+        for r in 0..num_rows_actual {
+            let start = row_boundaries[r];
+            let end = row_boundaries.get(r + 1).copied().unwrap_or(n);
+            let sum_r: f32 = aspects[start..end].iter().sum();
+            row_heights.push(inner_w / sum_r.max(1e-6));
+        }
+        let total_height: f32 = row_heights.iter().sum();
+        let scale = inner_h / total_height.max(1e-6);
+
+        // 为每张卡计算世界坐标中心与显示尺寸，并写回 random_offset / display_scale
+        for r in 0..num_rows_actual {
+            let start = row_boundaries[r];
+            let end = row_boundaries.get(r + 1).copied().unwrap_or(n);
+            let row_h = row_heights[r] * scale;
+            let y_center = -half_h + row_h * 0.5
+                + (0..r).map(|rr| row_heights[rr] * scale).sum::<f32>();
+
+            let mut x = -half_w;
+            for i in start..end {
+                let card = &mut self.cards[i];
+                let a = aspects[i];
+                let w = a * row_h;
+                let x_center = x + w * 0.5;
+                x += w;
+
+                let (layout_pos, layout_rot) = self.stack_layout.position_and_rotation(i, n);
+                let layout_pos = layout_pos.to_vec2();
+                let world_center = egui::Vec2::new(x_center, y_center);
+                let new_offset = world_center - layout_pos;
+
+                card.anim_position_delta = card.random_offset - new_offset;
+                card.random_offset = new_offset;
+                card.anim_rotation_offset = 0.0;
+                card.random_rotation = -layout_rot;
+
+                let effective = self.stack_layout.effective_display_size(card.intrinsic_size, i, n);
+                let eff_x = effective.x.max(1e-6);
+                let eff_y = effective.y.max(1e-6);
+                let display_scale = (w / eff_x).min(row_h / eff_y);
+                card.display_scale = display_scale.clamp(DISPLAY_SCALE_MIN, DISPLAY_SCALE_MAX);
+            }
+        }
+
         self.view_scale = 1.8;
         self.view_offset = egui::Vec2::ZERO;
     }
