@@ -8,6 +8,7 @@
 
 ## 未发布
 
+- **2025-03-03** 底部栏右下角显示版本号（半透明灰色）与左键点住图片时显示该图完整文件名。涉及：`src/app.rs`、`docs/INTERACTIONS.md`。
 - **2025-03-02** 阵列（热力图式）紧密排列：阵列改为按原比例、无缝紧密排列（类似股市热力图）。行内与行间无缝隙，每行等高、按 aspect 贪心分行，整体缩放填满可用区域；内边距改为 4px。涉及：`src/app.rs`（`grid_arrange` 行式无缝排布、row_boundaries、display_scale 按矩形宽高计算）。
 - **2025-03-05** R-Tree 视口查询框扩大：查询时不再只用屏幕框，改为向四周各扩充 500 像素（`VIEWPORT_QUERY_PADDING`）再查 R-Tree，预加载邻域内的卡，减少平移时 pop-in。涉及：`src/app.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
 - **2025-03-05** 视口剔除保留 R-Tree：先用 R-Tree 查询与视口相交的卡，再仅对查询结果做 20% 可见面积判断，避免对 3000 张卡暴力遍历算面积。涉及：`src/app.rs`（恢复 `RTree::bulk_load`、`locate_in_envelope`，在查询结果上做 `intersection_area/area`）、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。

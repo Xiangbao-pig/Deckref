@@ -1359,12 +1359,27 @@ impl DeckRefApp {
             self.try_paste_from_clipboard(ctx);
         }
 
-        // 左侧边栏：模式切换（默认 / 灵感），两个圆角小方块，垂直居中避免被导航栏挡住
-        egui::SidePanel::left("deckref_mode_sidebar")
-            .exact_width(MODE_SIDEBAR_WIDTH)
-            .resizable(false)
+        // 左侧模式切换（默认 / 灵感）：改为叠加层，始终在图片上方
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("deckref_mode_sidebar"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::new(screen.min.x, screen.min.y + TOP_BAR_HEIGHT))
+            .constrain(true)
             .show(ctx, |ui| {
-                let button_block_height = 36.0 * 2.0 + 6.0; // 两个按钮 + 间距
+                ui.set_min_size(egui::Vec2::new(
+                    MODE_SIDEBAR_WIDTH,
+                    screen.height() - TOP_BAR_HEIGHT - BOTTOM_BAR_HEIGHT,
+                ));
+                let fill = ui.visuals().window_fill();
+                let c = egui::Color32::from(fill);
+                let a = (c.a() as f32 * 0.04).round() as u8;
+                let bg = egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
+                ui.painter().rect_filled(
+                    Rect::from_min_size(egui::Pos2::ZERO, ui.available_size()),
+                    egui::Rounding::same(0.0),
+                    bg,
+                );
+                let button_block_height = 36.0 * 2.0 + 6.0;
                 let top_space = (ui.available_height() - button_block_height) / 2.0;
                 ui.add_space(top_space.max(0.0));
                 let size = 36.0;
@@ -1748,7 +1763,7 @@ impl DeckRefApp {
                 // 半透明底，增加质感
                 let fill = ui.visuals().window_fill();
                 let c = egui::Color32::from(fill);
-                let a = (c.a() as f32 * 0.92).round() as u8;
+                let a = (c.a() as f32 * 0.04).round() as u8;
                 let bg = egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
                 ui.painter().rect_filled(
                     Rect::from_min_size(egui::Pos2::ZERO, ui.available_size()),
@@ -2004,7 +2019,7 @@ impl DeckRefApp {
                 ui.set_min_size(egui::Vec2::new(screen.width(), BOTTOM_BAR_HEIGHT));
                 let fill = ui.visuals().window_fill();
                 let c = egui::Color32::from(fill);
-                let a = (c.a() as f32 * 0.92).round() as u8;
+                let a = (c.a() as f32 * 0.04).round() as u8;
                 let bg = egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
                 ui.painter().rect_filled(
                     Rect::from_min_size(egui::Pos2::ZERO, ui.available_size()),
@@ -2028,6 +2043,41 @@ impl DeckRefApp {
                         {
                             self.grid_arrange();
                         }
+                        // 右侧：左键点住某张图时显示该图完整文件名，以及始终显示版本号（半透明灰色）
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let gray = egui::Color32::from_rgba_unmultiplied(100, 100, 100, 160);
+                                let version = env!("CARGO_PKG_VERSION");
+                                ui.label(
+                                    egui::RichText::new(format!("v{}", version))
+                                        .color(gray)
+                                        .size(11.0),
+                                );
+                                let held_index = self
+                                    .long_press
+                                    .as_ref()
+                                    .map(|(i, _)| *i)
+                                    .or_else(|| self.picked_up.as_ref().map(|(i, _, _)| *i));
+                                if let Some(idx) = held_index {
+                                    if let Some(card) = self.cards.get(idx) {
+                                        let name = card.path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or(card.file_name.as_str());
+                                        ui.add_space(8.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(name)
+                                                    .color(gray)
+                                                    .size(11.0),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                }
+                            },
+                        );
                     },
                 );
             });
