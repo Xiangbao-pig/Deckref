@@ -8,6 +8,11 @@
 
 ## 未发布
 
+- **2025-03-05** R-Tree 视口查询框扩大：查询时不再只用屏幕框，改为向四周各扩充 500 像素（`VIEWPORT_QUERY_PADDING`）再查 R-Tree，预加载邻域内的卡，减少平移时 pop-in。涉及：`src/app.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+- **2025-03-05** 视口剔除保留 R-Tree：先用 R-Tree 查询与视口相交的卡，再仅对查询结果做 20% 可见面积判断，避免对 3000 张卡暴力遍历算面积。涉及：`src/app.rs`（恢复 `RTree::bulk_load`、`locate_in_envelope`，在查询结果上做 `intersection_area/area`）、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+- **2025-03-05** 视口剔除放宽为「80% 在屏外才剔除」：参考成熟参考图软件，仅当卡片可见比例 < 20% 时剔除（即 80% 以上在屏幕外）；使用 AABB 的 `intersection_area` / `area` 计算可见比例，移除 RTree 查询。涉及：`src/app.rs`（`VISIBLE_RATIO_THRESHOLD`、可见比例过滤）、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+- **2025-03-05** 渲染循环视口剔除：引入 **rstar** 存储每张卡在屏幕空间的 AABB，渲染前用 `ui.clip_rect().expand2(32)` 作视口，`RTree::bulk_load` + `locate_in_envelope` 得到可见卡索引；仅对可见卡调用 `ensure_texture` 与 `draw_card`，拿起中的卡始终参与 AABB 与绘制。主线程大图解码：确认 `ensure_texture` 在回退路径中仍用 `load_image_thumbnail`（>2048px），主线程绝不完整解码超大图。涉及：`Cargo.toml`（rstar）、`src/app.rs`（`CardScreenRect`、`screen_aabb_for_rotated_rect`、视口剔除与可见集）、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+- **2025-03-05** 纹理解码前后端分离：图片解码移至后台线程 `deckref-tex-loader`，主线程仅做 GPU 上传。`ensure_texture` 未命中时只将 path 发往后台并加入 pending，本帧返回 None；每帧 `poll_texture_results` 最多上传 5 张已完成解码的纹理，切换文件夹/清空时清空 pending。请求顺序改为堆叠前端优先（`cards.iter().rev()`），可见图先出现。spawn 失败时回退为同步解码。涉及：`src/image_ops.rs`（`load_image_rgba_for_texture`）、`src/app.rs`（`run_texture_loader_thread`、`texture_loading_tx/rx`、`pending_texture_paths`、`poll_texture_results`、`ensure_texture`）、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
 - **2025-03-05** 纹理缓存清理：仅保留最近 **10 个文件夹**的图片纹理缓存，超过后自动淘汰最久未访问的文件夹下全部纹理，控制显存与内存；切换至未缓存文件夹或点击「清空」时清空缓存与作用域。涉及：`src/app.rs`（`texture_cache_scope`、`MAX_TEXTURE_CACHE_FOLDERS`、`ensure_texture` 按文件夹加入/淘汰、`apply_watch_path`/清空时清 scope）、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
 - **2025-03-05** 高分辨率图缩略图加载：当图片最长边 > 2048px 时，堆叠预览使用缩略图（最长边 1200px、CatmullRom 缩放）而非原图，在 2K 屏上仍保持清晰的同时显著降低解码时间与显存占用（适合单反/50MB 级大图）。涉及：`src/image_ops.rs`（`load_image_thumbnail`、`THUMBNAIL_RESOLUTION_THRESHOLD`、`THUMBNAIL_MAX_LONGEST_EDGE`）、`src/app.rs`（`ensure_texture`）、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
 - **2025-03-05** Windows 打包：新增卸载程序与配置说明。ANzhuang 内增加 **卸载.bat**（可选删除 %APPDATA%\DeckRef 后提示手动删除安装文件夹）、**config_readme.txt**（环境与配置说明：无需 .env、配置目录为 DeckRef）；修正使用说明与文档中配置路径为 `%APPDATA%\DeckRef`。涉及：`scripts/uninstall_win.bat`、`scripts/config_readme_win.txt`、`scripts/install_readme_win.txt`、`scripts/build_windows.ps1`、`docs/BUILD_WINDOWS.md`。
@@ -46,6 +51,14 @@
 ---
 
 ## 已发布
+
+### [0.1.3] - 2025-03-05
+
+- **纹理解码前后端分离**：图片解码移至后台线程 `deckref-tex-loader`，主线程仅做 GPU 上传；未命中时 path 发往后台、本帧返回 None，每帧最多上传 5 张完成解码的纹理；请求顺序堆叠前端优先。
+- **视口剔除 + R-Tree**：使用 **rstar** 存储每卡屏幕 AABB，渲染前用视口（clip_rect 扩大 32px）做 `RTree::bulk_load` + `locate_in_envelope`；仅对可见卡调用 `ensure_texture` 与绘制；视口查询向四周扩充 500px 预加载邻域，可见比例 < 20% 才剔除。
+- **依赖**：新增 `rstar`。
+
+（此前若有版本发布，可在此按版本/时间罗列。）
 
 ### [0.1.2] - 2025-03-05
 

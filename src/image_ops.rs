@@ -137,6 +137,19 @@ pub fn load_image_thumbnail(path: &Path, max_longest_edge: u32) -> AppResult<Dyn
     Ok(img.resize_exact(nw, nh, FilterType::CatmullRom))
 }
 
+/// 供后台纹理加载线程使用：解码为 RGBA 字节（大图用缩略图），返回 (rgba_vec, width, height)。
+pub fn load_image_rgba_for_texture(path: &Path) -> AppResult<(Vec<u8>, u32, u32)> {
+    let (w, h) = image_dimensions(path)?;
+    let img = if w.max(h) > THUMBNAIL_RESOLUTION_THRESHOLD {
+        load_image_thumbnail(path, THUMBNAIL_MAX_LONGEST_EDGE)?
+    } else {
+        load_image(path)?
+    };
+    let (width, height) = (img.width(), img.height());
+    let rgba = img.to_rgba8();
+    Ok((rgba.into_raw(), width, height))
+}
+
 /// 从 PSD 文件加载为 DynamicImage（RGBA）。失败时返回 AppError。
 fn load_psd(path: &Path) -> AppResult<DynamicImage> {
     use image::ImageBuffer;

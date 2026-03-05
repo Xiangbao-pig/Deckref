@@ -12,7 +12,8 @@ use crate::mode::AppMode;
 use crate::settings;
 use crate::watcher::{list_existing_image_paths_with_metadata, list_existing_image_paths, WatchEvent, WatcherConfig};
 use crate::window_state;
-use eframe::egui::{self, ColorImage, Rect, TextureHandle, Vec2};
+use eframe::egui::{self, emath::Rot2, ColorImage, Rect, TextureHandle, Vec2};
+use rstar::{AABB, Envelope, RTree, RTreeObject};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf, Component};
@@ -114,7 +115,39 @@ fn list_subdirs(path: &Path, limit: usize) -> Vec<PathBuf> {
     d
 }
 
-/// 后台加载线程：扫描目录/最近文件/截图目录，取 dimensions+metadata 后通过 channel 发送，主线程用 from_path_with_metadata 构造卡片。
+/// 用于视口剔除：卡片在屏幕空间的 AABB + 索引。先经 R-Tree 查询与视口相交的卡，再对查询结果做可见比例判断。
+struct CardScreenRect {
+    index: usize,
+    aabb: AABB<[f64; 2]>,
+}
+impl RTreeObject for CardScreenRect {
+    type Envelope = AABB<[f64; 2]>;
+    fn envelope(&self) -> Self::Envelope {
+        self.aabb
+    }
+}
+
+/// 由世界坐标中心、半尺寸、旋转角与 world_to_screen 得到屏幕空间 AABB（用于可见比例计算）。
+fn screen_aabb_for_rotated_rect(
+    world_center: egui::Pos2,
+    half_size: egui::Vec2,
+    rot: f32,
+    world_to_screen: impl Fn(egui::Pos2) -> egui::Pos2,
+) -> AABB<[f64; 2]> {
+    let r = Rot2::from_angle(rot);
+    let corners = [
+        world_center + r * Vec2::new(half_size.x, half_size.y),
+        world_center + r * Vec2::new(-half_size.x, half_size.y),
+        world_center + r * Vec2::new(-half_size.x, -half_size.y),
+        world_center + r * Vec2::new(half_size.x, -half_size.y),
+    ];
+    let screen: Vec<egui::Pos2> = corners.iter().map(|&p| world_to_screen(p)).collect();
+    let min_x = screen.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+    let min_y = screen.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+    let max_x = screen.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+    let max_y = screen.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+    AABB::from_corners([min_x as f64, min_y as f64], [max_x as f64, max_y as f64])
+}
 fn run_loader_thread(
     mode: AppMode,
     watch_path: PathBuf,
@@ -192,6 +225,18 @@ fn run_loader_thread(
         }
     }
     drop(tx);
+}
+
+/// 后台纹理解码线程：从 req_rx 收 path，解码为 RGBA（大图缩略图），通过 res_tx 回传；主线程只做 GPU 上传。
+fn run_texture_loader_thread(
+    req_rx: mpsc::Receiver<PathBuf>,
+    res_tx: mpsc::Sender<(PathBuf, Vec<u8>, u32, u32)>,
+) {
+    for path in req_rx {
+        if let Ok((rgba, w, h)) = image_ops::load_image_rgba_for_texture(&path) {
+            let _ = res_tx.send((path, rgba, w, h));
+        }
+    }
 }
 
 /// 拿起状态：卡片索引 + 抓取时指针相对卡片中心的世界坐标偏移（用于跟手）
@@ -290,6 +335,14 @@ pub struct DeckRefApp {
     right_drag_started: bool,
     /// 上一帧发送的窗口位置（目标 = last_sent + delta 取整，减少累积误差）
     right_drag_last_sent: Option<egui::Pos2>,
+    /// 纹理加载请求发送端：主线程只发 path，后台线程解码后通过 texture_loading_rx 回传 RGBA
+    texture_loading_tx: Option<mpsc::Sender<PathBuf>>,
+    /// 后台解码完成的纹理 (path, rgba, width, height)，主线程每帧取若干做 GPU 上传
+    texture_loading_rx: Option<mpsc::Receiver<(PathBuf, Vec<u8>, u32, u32)>>,
+    /// 纹理加载线程 handle，进程退出时 drop 即可
+    _texture_loading_handle: Option<thread::JoinHandle<()>>,
+    /// 已请求但尚未收到结果的 path，避免重复请求；切换文件夹/清空时清空
+    pending_texture_paths: HashSet<PathBuf>,
 }
 
 impl DeckRefApp {
@@ -312,6 +365,15 @@ impl DeckRefApp {
             ..WatcherConfig::default()
         };
         let handle = crate::watcher::run_watcher(config, tx)?;
+        let (tex_req_tx, tex_req_rx) = mpsc::channel();
+        let (tex_res_tx, tex_res_rx) = mpsc::channel();
+        let tex_handle = thread::Builder::new()
+            .name("deckref-tex-loader".into())
+            .spawn(move || run_texture_loader_thread(tex_req_rx, tex_res_tx));
+        let (texture_loading_tx, texture_loading_rx, _texture_loading_handle) = match tex_handle {
+            Ok(h) => (Some(tex_req_tx), Some(tex_res_rx), Some(h)),
+            Err(_) => (None, None, None),
+        };
         let mut app = Self {
             watch_rx: rx,
             _watcher_handle: Some(handle),
@@ -377,6 +439,10 @@ impl DeckRefApp {
             right_drag_pending_delta: egui::Vec2::ZERO,
             right_drag_started: false,
             right_drag_last_sent: None,
+            texture_loading_tx,
+            texture_loading_rx,
+            _texture_loading_handle,
+            pending_texture_paths: HashSet::new(),
         };
         app.start_async_load();
         Ok(app)
@@ -562,6 +628,7 @@ impl DeckRefApp {
             self.cards.clear();
             self.texture_cache.clear();
             self.texture_cache_scope.clear();
+            self.pending_texture_paths.clear();
             if let Some(rx) = self.loading_rx.take() {
                 drop(rx);
             }
@@ -894,11 +961,21 @@ impl DeckRefApp {
     }
 
     /// 确保纹理已加载；若失败则返回 None，不 panic。
-    /// 当图片最长边超过 THUMBNAIL_RESOLUTION_THRESHOLD 时加载缩略图（最长边 THUMBNAIL_MAX_LONGEST_EDGE），保证 2K 屏清晰且节省内存与解码时间。
+    /// 优先走后台解码线程（请求入队、本帧返回 None），主线程仅在 poll_texture_results 中做 GPU 上传。
+    /// 无后台线程时的回退路径仅在 spawn 失败时触发；回退中仍用缩略图（>2048px 用 load_image_thumbnail），主线程绝不完整解码超大图。
     fn ensure_texture(&mut self, ctx: &egui::Context, path: &PathBuf) -> Option<&TextureHandle> {
         if self.texture_cache.contains_key(path) {
             return self.texture_cache.get(path);
         }
+        if let Some(ref tx) = self.texture_loading_tx {
+            if self.pending_texture_paths.contains(path) {
+                return None;
+            }
+            let _ = tx.send(path.clone());
+            self.pending_texture_paths.insert(path.clone());
+            return None;
+        }
+        // 回退：无后台线程时同步解码（避免 spawn 失败后无法显示图）
         let img = match image_ops::image_dimensions(path) {
             Ok((w, h)) if w.max(h) > image_ops::THUMBNAIL_RESOLUTION_THRESHOLD => {
                 image_ops::load_image_thumbnail(path, image_ops::THUMBNAIL_MAX_LONGEST_EDGE).ok()
@@ -911,7 +988,6 @@ impl DeckRefApp {
         let name = path.to_string_lossy().to_string();
         let handle = ctx.load_texture(name, color_image, Default::default());
         self.texture_cache.insert(path.clone(), handle);
-        // 按文件夹限定纹理缓存：仅保留最近 MAX_TEXTURE_CACHE_FOLDERS 个文件夹的纹理，超出则淘汰最久未用的文件夹
         if let Some(folder) = path.parent() {
             let folder = folder.to_path_buf();
             self.texture_cache_scope.retain(|p| p != &folder);
@@ -923,6 +999,43 @@ impl DeckRefApp {
             }
         }
         self.texture_cache.get(path)
+    }
+
+    /// 每帧从后台纹理解码线程取若干已完成结果，仅对仍属于当前卡片的 path 做 GPU 上传并写入缓存；每帧上限以平滑 UI。
+    fn poll_texture_results(&mut self, ctx: &egui::Context) {
+        const UPLOADS_PER_FRAME: usize = 5;
+        let Some(ref rx) = self.texture_loading_rx else {
+            return;
+        };
+        let mut uploaded = 0;
+        while uploaded < UPLOADS_PER_FRAME {
+            let Ok((path, rgba, width, height)) = rx.try_recv() else {
+                break;
+            };
+            self.pending_texture_paths.remove(&path);
+            if !self.cards.iter().any(|c| c.path == path) {
+                continue;
+            }
+            let size = [width as usize, height as usize];
+            let color_image = ColorImage::from_rgba_unmultiplied(size, &rgba);
+            let name = path.to_string_lossy().to_string();
+            let handle = ctx.load_texture(name, color_image, Default::default());
+            self.texture_cache.insert(path.clone(), handle);
+            if let Some(folder) = path.parent() {
+                let folder = folder.to_path_buf();
+                self.texture_cache_scope.retain(|p| p != &folder);
+                self.texture_cache_scope.insert(0, folder.clone());
+                while self.texture_cache_scope.len() > MAX_TEXTURE_CACHE_FOLDERS {
+                    if let Some(old) = self.texture_cache_scope.pop() {
+                        self.texture_cache.retain(|k, _| !k.starts_with(&old));
+                    }
+                }
+            }
+            uploaded += 1;
+        }
+        if uploaded > 0 {
+            ctx.request_repaint();
+        }
     }
 
     /// 若存在 assets/icon.png 则加载为标题栏 logo 纹理，只尝试一次，失败不重试。
@@ -1162,6 +1275,9 @@ impl DeckRefApp {
         // 消费异步加载线程发来的卡片（启动或切换模式后）
         self.poll_loading_cards();
 
+        // 消费后台纹理解码结果，每帧最多上传若干张，避免单帧卡顿
+        self.poll_texture_results(ctx);
+
         // 运行时监听到剪贴板截图：仅当「按下 Shift 后的约 5 秒内」且剪贴板图片与上次不同时，保存到 Ref/Screenshots（screenshot-N.png），灵感模式下即时显示；否则不保存，避免误存 QQ/浏览器等复制的图
         self.poll_clipboard_screenshot(ctx);
 
@@ -1311,19 +1427,83 @@ impl DeckRefApp {
                         self.recently_dropped_index = None;
                     }
 
-                    // 先复制路径，再预加载纹理，避免在迭代时同时可变借用 self
-                    let paths: Vec<PathBuf> = self.cards.iter().map(|c| c.path.clone()).collect();
-                    for path in &paths {
+                    // 视口剔除：先用 R-Tree 查出与视口相交的卡（将计算量从 N 降到数十），再仅对查询结果做面积占比判断（可见 < 20% 才剔除）
+                    const VISIBLE_RATIO_THRESHOLD: f64 = 0.2;
+                    /// R-Tree 查询时视口向四周扩充的像素（大一圈的框，预加载邻域内的卡，减少平移时 pop-in）
+                    const VIEWPORT_QUERY_PADDING: f32 = 500.0;
+                    let viewport_for_culling = ui.clip_rect().expand2(egui::Vec2::splat(VIEWPORT_QUERY_PADDING));
+                    let viewport_aabb = AABB::from_corners(
+                        [viewport_for_culling.min.x as f64, viewport_for_culling.min.y as f64],
+                        [viewport_for_culling.max.x as f64, viewport_for_culling.max.y as f64],
+                    );
+                    let mut rects: Vec<CardScreenRect> = Vec::with_capacity(n);
+                    for (i, card) in self.cards.iter().enumerate() {
+                        let (world_pos, rot) = self.stack_layout.position_and_rotation(i, n);
+                        let world_center = if Some(i) == picked_up_index {
+                            self.held_smooth_pos
+                                .map(|v| egui::Pos2::new(v.x, v.y))
+                                .unwrap_or(world_pos + card.random_offset + card.anim_position_delta)
+                        } else {
+                            world_pos + card.random_offset + card.anim_position_delta
+                        };
+                        let rot = rot + card.random_rotation + card.anim_rotation_offset;
+                        let size = self.stack_layout.effective_display_size(card.intrinsic_size, i, n);
+                        let scale = if Some(i) == picked_up_index {
+                            self.held_scale.unwrap_or(1.0)
+                        } else {
+                            card.display_scale
+                        };
+                        let size = size * scale * view_scale;
+                        let half = size / 2.0;
+                        let aabb = screen_aabb_for_rotated_rect(world_center, half, rot, &world_to_screen);
+                        rects.push(CardScreenRect { index: i, aabb });
+                    }
+                    let tree = RTree::bulk_load(rects);
+                    let visible_indices: HashSet<usize> = tree
+                        .locate_in_envelope(&viewport_aabb)
+                        .filter_map(|r| {
+                            let card_area = r.aabb.area();
+                            if card_area <= 0.0 {
+                                return Some(r.index);
+                            }
+                            let inter = r.aabb.intersection_area(&viewport_aabb);
+                            if inter / card_area >= VISIBLE_RATIO_THRESHOLD {
+                                Some(r.index)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    // 仅对可见卡（及拿起卡）请求纹理，堆叠前端优先
+                    let paths_to_load: Vec<PathBuf> = self
+                        .cards
+                        .iter()
+                        .rev()
+                        .enumerate()
+                        .filter_map(|(rev_i, c)| {
+                            let index = n - 1 - rev_i;
+                            if visible_indices.contains(&index) {
+                                Some(c.path.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for path in &paths_to_load {
                         let _ = self.ensure_texture(ctx, path);
                     }
 
-                    // 绘制：世界坐标 + 随机偏移，再转屏幕坐标；扩大裁剪区使图片可超出面板
+                    // 绘制：仅绘制可见卡（可见比例 >= 20%，即 80% 在屏外才剔除），扩大裁剪区使图片可超出面板
                     let orig_clip = ui.clip_rect();
                     ui.set_clip_rect(ui.ctx().screen_rect().expand2(egui::Vec2::splat(5000.0)));
                     let painter = ui.painter();
                     let now = ctx.input(|i| i.time) as f32;
                     for (i, card) in self.cards.iter().enumerate() {
                         if self.picked_up.as_ref().map(|(idx, _, _)| *idx) == Some(i) {
+                            continue;
+                        }
+                        if !visible_indices.contains(&i) {
                             continue;
                         }
                         let (world_pos, rot) = self.stack_layout.position_and_rotation(i, n);
@@ -1735,6 +1915,7 @@ impl DeckRefApp {
                         self.cards.clear();
                         self.texture_cache.clear();
                         self.texture_cache_scope.clear();
+                        self.pending_texture_paths.clear();
                     }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),

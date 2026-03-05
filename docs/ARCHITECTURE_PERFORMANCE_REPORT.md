@@ -60,13 +60,13 @@ main
 update() → run_ui(ctx, frame)
   → poll_watch_events()                  // try_recv 消费所有 pending
   → poll_loading_cards()                // 消费异步加载线程发来的卡片
+  → poll_texture_results(ctx)           // 消费后台纹理解码结果，每帧最多 5 张 GPU 上传
   → 底部栏 / CentralPanel UI
   → 堆叠区域：
        → 命中检测（从最前到最后，每卡 position_and_rotation + rotated_rect_contains）
        → 每卡动画更新（lerp scale/rotation/position）
-       → paths = cards.iter().map(|c| c.path.clone()).collect()
-       → for path in paths { ensure_texture(ctx, path) }  // 可能解码图片
-       → 绘制所有卡片（未拿起的）
+       → 视口剔除：每卡屏幕 AABB 入 rstar R-Tree；**先用 R-Tree 查询与「视口 + 四周各 500px」相交的卡**（O(log N)），**仅对查询结果**做可见比例 = 相交面积/卡片面积，仅当可见比例 < 20% 时剔除（将面积计算从 N 次降到数十次）
+       → 仅对可见卡 ensure_texture（堆叠前端优先），仅对可见卡 draw_card；拿起卡恒参与
        → 若有拿起卡，再绘制阴影 + 该卡
        → 长按/拿起/松手/滚轮缩放等状态更新
   → 若 drag_pending：canonicalize + drag::start_drag（主线程）
@@ -78,10 +78,12 @@ update() → run_ui(ctx, frame)
 
 ### 2.3 纹理加载（ensure_texture）
 
-- 使用 `HashMap<PathBuf, TextureHandle>` 作为纹理缓存；**清理模式**：仅保留最近 **MAX_TEXTURE_CACHE_FOLDERS（10）个文件夹**的纹理，按「最近使用」顺序维护 `texture_cache_scope`，超过时淘汰最久未访问的文件夹下全部纹理，控制显存与内存。切换至未缓存文件夹或点击「清空」时清空 cache 与 scope。
-- 逻辑：若 cache 中无该 path，则先 `image_ops::image_dimensions(path)` 判断尺寸；若**最长边 > THUMBNAIL_RESOLUTION_THRESHOLD（2048）**则调用 `load_image_thumbnail(path, THUMBNAIL_MAX_LONGEST_EDGE)`（解码后缩放到最长边 1200px，CatmullRom），否则 `load_image(path)` 原图；再 `ColorImage::from_rgba_unmultiplied(...)`、`ctx.load_texture(...)` 并插入 cache；插入后将该 path 所在文件夹加入 scope 前端，若 scope 超过 10 则弹出最旧文件夹并 evict 其下全部纹理。
+- 使用 `HashMap<PathBuf, TextureHandle>` 作为纹理缓存；**清理模式**：仅保留最近 **MAX_TEXTURE_CACHE_FOLDERS（10）个文件夹**的纹理，按「最近使用」顺序维护 `texture_cache_scope`，超过时淘汰最久未访问的文件夹下全部纹理，控制显存与内存。切换至未缓存文件夹或点击「清空」时清空 cache、scope 与 `pending_texture_paths`。
+- **前后端分离**：纹理解码在后台线程 `deckref-tex-loader` 完成（`image_ops::load_image_rgba_for_texture`：大图缩略图），主线程只做 `ColorImage::from_rgba_unmultiplied` + `ctx.load_texture`。`ensure_texture` 未命中时仅将 path 发送到 `texture_loading_tx` 并加入 `pending_texture_paths`，本帧返回 None；每帧 `poll_texture_results` 从 `texture_loading_rx` 取最多 **UPLOADS_PER_FRAME（5）** 个结果，仅当 path 仍属于当前 `cards` 时上传并插入 cache，避免切换文件夹后仍写入旧纹理。请求顺序为堆叠前端优先（`cards.iter().rev()`），可见图先出现。
 - **缩略图**：高分辨率大图（如单反 50MB）在堆叠预览时只加载 1200px 最长边的缩略图，保证 2K 屏清晰且降低解码与显存；原图仍用于布局尺寸（intrinsic_size 来自启动时 dimensions）。
-- **每帧**对当前所有卡片的 path 调用 `ensure_texture`，未命中时才解码；首帧或新加入卡片时，多张同时未命中会在主线程顺序解码（但每张若为超大图则只解码缩略图）。
+- **每帧**仅对**视口内**卡片的 path 调用 `ensure_texture`（rstar 视口剔除）；未命中且后台可用时只发请求不阻塞；主线程不再在本帧内做解码，仅在上传完成的帧重绘。**主线程回退**（loader spawn 失败时）：仍用 `load_image_thumbnail` 处理 >2048px 大图，主线程绝不完整解码超大图。
+
+~~**后续可进一步优化**：视口剔除（仅对可能可见的卡请求纹理）；~~ **已实施**：rstar + clip_rect 视口剔除。每帧 path 复用减少分配；`UPLOADS_PER_FRAME` 可配置；监听事件中的 dimensions/from_path 可移入后台。
 
 ### 2.4 文件监听与新增卡片
 
@@ -103,16 +105,16 @@ update() → run_ui(ctx, frame)
 
 1. **主线程阻塞**
    - ~~启动：`load_existing_images` 中目录扫描 + 每文件多次 metadata/dimensions，全部在主线程。~~ **已优化**：启动改为 `start_async_load` + 后台线程 + `poll_loading_cards` 消费。
-   - 每帧：所有 UI、命中检测、动画、纹理未命中时的解码、绘制，均在同一线程。
+   - ~~每帧：所有 UI、命中检测、动画、纹理未命中时的解码、绘制，均在同一线程。~~ **已优化**：纹理解码在后台线程 `deckref-tex-loader`，主线程仅做每帧最多 5 张 GPU 上传；UI、命中检测、动画、绘制仍在主线程。
    - 剪贴板：每 `CLIPBOARD_POLL_INTERVAL`（0.8s）在主线程读一次剪贴板并哈希；偶发系统 API 阻塞时可能短时卡顿，频率已节流。
 
 2. **纹理与图片**
-   - ~~纹理为**原图**解码，显示尺寸由 `effective_display_size` 缩小，存在「大图小显」的显存与解码成本。~~ **已优化**：最长边 > 2048px 的图在 `ensure_texture` 时加载缩略图（最长边 1200px），2K 屏上仍清晰，解码与显存显著降低。
-   - 首展或批量加入时，多张未命中会在主线程顺序解码（超大图仅解码缩略图）。
+   - ~~纹理为**原图**解码，显示尺寸由 `effective_display_size` 缩小，存在「大图小显」的显存与解码成本。~~ **已优化**：最长边 > 2048px 的图在后台或回退路径均用缩略图（最长边 1200px）；主线程回退时也走 `load_image_thumbnail`，绝不完整解码超大图。
+   - 首展或批量加入时，仅可见卡会请求纹理；未命中由后台解码，主线程只做上传。
 
 3. **每帧分配与 work**
-   - `paths: Vec<PathBuf> = self.cards.iter().map(|c| c.path.clone()).collect()` 每帧分配。
-   - 对全部卡片做命中检测、动画更新、ensure_texture；无视口剔除或 LOD，卡片数固定上限 80。
+   - 视口剔除后仅对可见卡做 ensure_texture 与绘制；每帧仍构建 `Vec<CardScreenRect>` 并 `RTree::bulk_load`，可见集为 HashSet<usize>。
+   - ~~对全部卡片做命中检测、动画更新、ensure_texture；无视口剔除或 LOD，卡片数固定上限 80。~~ **已优化**：rstar 视口剔除，仅可见卡请求纹理与绘制。
 
 4. **IO 重复与一致性**
    - ~~启动：同一文件的 metadata 在排序与 `ImageCard::from_path` 中各用一次；dimensions 与 from_path 分开调用，存在重复打开文件。~~ **已优化**：启动使用 `list_existing_image_paths_with_metadata`（一次 metadata）+ 后台线程 `image_dimensions` + 主线程 `from_path_with_metadata`（零 IO）。
