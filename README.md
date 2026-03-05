@@ -27,17 +27,11 @@ cargo run --release
 | [CHANGELOG.md](CHANGELOG.md) | 功能与修复记录 |
 | [docs/INTERACTIONS.md](docs/INTERACTIONS.md) | 交互方式说明 |
 | [docs/SETTINGS.md](docs/SETTINGS.md) | 设置项说明与存储约定 |
-| [docs/WORKFLOW.md](docs/WORKFLOW.md) | Agent 协作与开发流程 |
-| [docs/AGENT_ROLES.md](docs/AGENT_ROLES.md) | Agent 角色与职责约定 |
 | [docs/BUILD_WINDOWS.md](docs/BUILD_WINDOWS.md) | Windows 打包与分发 |
 | [docs/BUILD_MAC.md](docs/BUILD_MAC.md) | macOS 运行与打包 |
-| [AGENTS.md](AGENTS.md) | Agent 使用约定 |
-
-## 今日开发进展（2025-03-03）
-
-- **双模式**：默认 / 灵感（灵感模式 Windows 下展示「最近使用的文件」图片，保存到 Inspiration 目录）；模式切换保留缓存。
-- **地址栏**：面包屑点击跳转、子目录 ▾、**最近到访** 下拉（5 条持久化）、输入/粘贴路径、后退/前进；启动恢复上次文件夹。
-- **设置与状态**：设置持久化（反转平移、拖拽出窗口）；窗口尺寸与上次路径恢复；配置目录 `last_path.txt` / `recent_folders.txt` / `settings.txt`。
-- **体验与修复**：启动异步加载（后台扫描与元数据）；拖出又拖回仅置顶不复制；HDROP 与 FileContents 二选一避免重复保存；文档 `SETTINGS.md`、`TESTING.md`。
 
 更细的变更按日期见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。

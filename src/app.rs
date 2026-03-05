@@ -315,7 +315,8 @@ pub struct DeckRefApp {
     #[cfg(windows)]
     /// 已注册的窗口句柄，模式切换时用于重新注册到新 watch_path
     win_drop_hwnd: Option<isize>,
-    /// 标题栏 logo 纹理（来自 assets/icon.png），无则只显示文字
+    /// 标题栏 logo 纹理（来自 assets/icon.png），当前未使用，保留供后续使用）
+    #[allow(dead_code)]
     logo_texture: Option<TextureHandle>,
     /// 启动/切换模式时异步加载卡片：后台线程发送 (path, dimensions, metadata)，主线程每帧消费
     loading_rx: Option<mpsc::Receiver<(PathBuf, (u32, u32), (u64, SystemTime))>>,
@@ -1038,7 +1039,8 @@ impl DeckRefApp {
         }
     }
 
-    /// 若存在 assets/icon.png 则加载为标题栏 logo 纹理，只尝试一次，失败不重试。
+    /// 若存在 assets/icon.png 则加载为标题栏 logo 纹理，只尝试一次，失败不重试。（当前未使用）
+    #[allow(dead_code)]
     fn ensure_logo_texture(&mut self, ctx: &egui::Context) {
         if self.logo_texture.is_some() {
             return;
@@ -1494,10 +1496,10 @@ impl DeckRefApp {
                         }
                         card.anim_position_delta = lerp_position(card.anim_position_delta, egui::Vec2::ZERO, dt);
                     }
-                    if dropped_idx.is_some()
-                        && self.cards[dropped_idx.unwrap()].anim_rotation_offset.abs() < 1e-5
-                    {
-                        self.recently_dropped_index = None;
+                    if let Some(idx) = dropped_idx {
+                        if self.cards[idx].anim_rotation_offset.abs() < 1e-5 {
+                            self.recently_dropped_index = None;
+                        }
                     }
 
                     // 视口剔除：先用 R-Tree 查出与视口相交的卡（将计算量从 N 降到数十），再仅对查询结果做面积占比判断（可见 < 20% 才剔除）
@@ -1770,22 +1772,37 @@ impl DeckRefApp {
                     egui::Rounding::same(0.0),
                     bg,
                 );
-                self.ensure_logo_texture(ctx);
                 ui.horizontal(|ui| {
-                    if let Some(ref tex) = self.logo_texture {
-                        let size = 24.0;
-                        ui.add(
-                            egui::Image::new(egui::load::SizedTexture::new(
-                                tex.id(),
-                                egui::Vec2::new(size, size),
-                            ))
-                            .max_width(size)
-                            .max_height(size),
-                        );
-                        ui.add_space(4.0);
+                    if self.mode == AppMode::Default {
+                        let recent = self.recent_folders.clone();
+                        let current_path = PathBuf::from(&self.watch_path);
+                        egui::menu::menu_button(ui, "最近访问", |ui| {
+                            ui.set_max_width(320.0);
+                            ui.set_max_height(220.0);
+                            ui.label(egui::RichText::new("最近到访").size(12.0).strong());
+                            ui.separator();
+                            if recent.is_empty() {
+                                ui.label(egui::RichText::new("暂无").color(ui.visuals().weak_text_color()));
+                            } else {
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    for path in &recent {
+                                        if *path == current_path {
+                                            continue;
+                                        }
+                                        let s = path.display().to_string();
+                                        let truncate = if s.len() > 45 { format!("…{}", &s[s.len().saturating_sub(44)..]) } else { s.clone() };
+                                        if ui.button(truncate).on_hover_text(s).clicked() {
+                                            self.navigate_watch_path(path.clone(), true);
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            }
+                        })
+                        .response
+                        .on_hover_text("最近到访的 5 个文件夹，点击快速切换（有缓存）");
+                        ui.separator();
                     }
-                    ui.label("DeckRef");
-                    ui.separator();
                     if self.mode == AppMode::Default {
                         if ui.input(|i| i.key_pressed(egui::Key::L) && (i.modifiers.ctrl || i.modifiers.mac_cmd)) {
                             ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L));
@@ -1938,34 +1955,6 @@ impl DeckRefApp {
                                 blank_resp.response.on_hover_text("点击或 Ctrl+L 输入/粘贴路径");
                             }
 
-                            ui.add_space(4.0);
-                            let current_path = PathBuf::from(&self.watch_path);
-                            let recent = self.recent_folders.clone();
-                            egui::menu::menu_button(ui, egui::RichText::new(" ▾ ").color(ui.visuals().weak_text_color()), |ui| {
-                                ui.set_max_width(320.0);
-                                ui.set_max_height(220.0);
-                                ui.label(egui::RichText::new("最近到访").size(12.0).strong());
-                                ui.separator();
-                                if recent.is_empty() {
-                                    ui.label(egui::RichText::new("暂无").color(ui.visuals().weak_text_color()));
-                                } else {
-                                    egui::ScrollArea::vertical().show(ui, |ui| {
-                                        for path in &recent {
-                                            if *path == current_path {
-                                                continue;
-                                            }
-                                            let s = path.display().to_string();
-                                            let truncate = if s.len() > 45 { format!("…{}", &s[s.len().saturating_sub(44)..]) } else { s.clone() };
-                                            if ui.button(truncate).on_hover_text(s).clicked() {
-                                                self.navigate_watch_path(path.clone(), true);
-                                                ui.close_menu();
-                                            }
-                                        }
-                                    });
-                                }
-                            })
-                            .response
-                            .on_hover_text("最近到访的 5 个文件夹，点击快速切换（有缓存）");
                         }
                     } else {
                         ui.label(format!("监听: {}", self.watch_path))

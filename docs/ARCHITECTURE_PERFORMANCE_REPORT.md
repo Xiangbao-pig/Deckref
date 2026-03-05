@@ -21,13 +21,15 @@
 - **main.rs**：入口、窗口选项、CJK 字体加载、`DeckRefApp` 创建
 - **app.rs**：应用状态、UI 主循环、事件轮询、纹理缓存、卡片列表与交互
 - **watcher.rs**：目录扫描、防抖监听、通过 channel 发送 `WatchEvent`
-- **image_ops.rs**：`load_image`、`image_dimensions`、`save_image`（纯函数，无内部缓存）
+- **image_ops.rs**：`load_image`、`image_dimensions`、`save_image`、缩略图与后台解码（纯函数式接口，无内部缓存）
 - **image_card.rs**：`ImageCard` 结构、堆叠布局、命中检测、绘制（mesh/阴影）、动画插值
 - **error.rs**：统一错误类型与 `AppResult`
+- **mode.rs**：应用模式（默认/灵感）
+- **settings.rs**：设置结构体与持久化（settings.txt）
+- **window_state.rs**：窗口位置/尺寸与最近路径持久化
+- **Windows 专用**（`#[cfg(windows)]`）：**win_drop.rs**（OLE 拖放）、**win_move.rs**（右键拖动移动窗口）、**win_recent.rs**（最近使用的文件）
 
-整体是「单主线程 UI + 一个监听线程 + 一个按需存在的加载线程」的架构；启动时不再阻塞主线程。
-
----
+整体是「单主线程 UI + 一个监听线程 + 按需存在的加载线程与纹理解码线程」的架构；启动时不再阻塞主线程。
 
 ## 二、数据流与执行路径（与性能相关）
 

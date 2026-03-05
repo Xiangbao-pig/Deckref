@@ -24,3 +24,12 @@ secrets.*
 Thumbs.db
 *.log
 *.tmp
+
+# 内部 Agent / 开发流程文档（不对外公开，仅本地保留）
+AGENTS.md
+docs/AGENT_ROLES.md
+docs/WORKFLOW.md
+docs/GITHUB_SUBMISSION.md
+docs/TESTING.md
+docs/VISION.md
+docs/PUBLIC_REPO_CHECKLIST.md
