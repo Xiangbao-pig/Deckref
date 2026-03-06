@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="DeckRef"
+           Language="2052"
+           Version="$(var.Version)"
+           Manufacturer="DeckRef"
+           UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
+    <MajorUpgrade DowngradeErrorMessage="已安装更高版本，无法降级。" />
+    <MediaTemplate EmbedCab="yes" />
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="INSTALLDIR" Name="DeckRef" FileSource="$(var.SourceDir)">
+          <Component Id="MainExe" Guid="B2C3D4E5-F6A7-8901-BCDE-F12345678901">
+            <File Id="DeckRefExe" Name="deckref.exe" Source="deckref.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="Readme" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
+            <File Id="ReadmeTxt" Name="README.txt" Source="README.txt" KeyPath="yes" />
+          </Component>
+          <Component Id="ConfigReadme" Guid="D4E5F6A7-B8C9-0123-DEF1-234567890123">
+            <File Id="ConfigReadmeTxt" Name="config_readme.txt" Source="config_readme.txt" KeyPath="yes" />
+          </Component>
+          <Component Id="UninstallBat" Guid="E5F6A7B8-C9D0-1234-EF12-345678901234">
+            <File Id="UninstallBatFile" Name="Uninstall.bat" Source="Uninstall.bat" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppProgramMenuDir" Name="DeckRef" />
+      </Directory>
+    </Directory>
+    <DirectoryRef Id="AppProgramMenuDir">
+      <Component Id="Shortcut" Guid="A7B8C9D0-E1F2-3456-1234-567890123456">
+        <Shortcut Id="DeckRefShortcut"
+                  Name="DeckRef"
+                  Description="DeckRef 图片参考板"
+                  Target="[#DeckRefExe]"
+                  WorkingDirectory="INSTALLDIR" />
+        <RemoveFolder Id="AppProgramMenuDir" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\DeckRef" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <Feature Id="ProductFeature" Title="DeckRef" Level="1">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="Readme" />
+      <ComponentRef Id="ConfigReadme" />
+      <ComponentRef Id="UninstallBat" />
+      <ComponentRef Id="Shortcut" />
+    </Feature>
+  </Product>
+</Wix>

@@ -8,6 +8,7 @@
 
 ## 未发布
 
+- **2025-03-05** Windows 打包 v0.1.4：产物改为 **名称+版本号** 文件夹 `DeckRef-0.1.4`，内含 exe、使用说明、config_readme、卸载.bat；可选生成 MSI（需安装 WiX Toolset v3.11）。卸载脚本保留「是否清理 DeckRef 产生的缓存」选项，选 N 则下次安装可继续使用。Cargo.toml 版本设为 0.1.4。涉及：`Cargo.toml`、`scripts/build_windows.ps1`、`scripts/install_readme_win.txt`、`docs/BUILD_WINDOWS.md`、`.gitignore`（DeckRef-*）。
 - **2025-03-03** 底部栏右下角显示版本号（半透明灰色）与左键点住图片时显示该图完整文件名。涉及：`src/app.rs`、`docs/INTERACTIONS.md`。
 - **2025-03-02** 阵列（热力图式）紧密排列：阵列改为按原比例、无缝紧密排列（类似股市热力图）。行内与行间无缝隙，每行等高、按 aspect 贪心分行，整体缩放填满可用区域；内边距改为 4px。涉及：`src/app.rs`（`grid_arrange` 行式无缝排布、row_boundaries、display_scale 按矩形宽高计算）。
 - **2025-03-05** R-Tree 视口查询框扩大：查询时不再只用屏幕框，改为向四周各扩充 500 像素（`VIEWPORT_QUERY_PADDING`）再查 R-Tree，预加载邻域内的卡，减少平移时 pop-in。涉及：`src/app.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
@@ -53,6 +54,15 @@
 ---
 
 ## 已发布
+
+### [0.2.0] - 2025-03-05
+
+- **Windows 打包**：产物文件夹改为 **DeckRef-{版本号}**（如 `DeckRef-0.2.0`），内含 exe、使用说明、config_readme、Uninstall.bat；可选生成 MSI 安装包（需安装 WiX Toolset v3.11，`wix/DeckRef.wxs`）。
+- **界面**：底部栏右下角显示版本号（半透明）；左键点住图片时显示该图完整文件名。
+- **阵列**：热力图式紧密排列，按原比例无缝、行内/行间无缝隙，行等高、按宽高比贪心分行，整体缩放填满可用区域。
+- **安全**：新增 `SECURITY.md` 漏洞报告策略。
+
+（此前若有版本发布，可在此按版本/时间罗列。）
 
 ### [0.1.3] - 2025-03-05
 

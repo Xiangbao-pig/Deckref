@@ -276,6 +276,8 @@ pub struct DeckRefApp {
     /// 最近到访文件夹的卡片缓存，切换回时直接恢复、无需重新加载
     recent_folder_cards: std::collections::HashMap<PathBuf, Vec<ImageCard>>,
     stack_layout: StackLayout,
+    /// 当前内容区尺寸（每帧更新），仅在执行 阵列/一览 时写入 stack_layout.available_size，避免拖边调整窗口时已排好的图移位
+    last_stack_size: egui::Vec2,
     sort_order: CardSortOrder,
     long_press: Option<(usize, f64)>,
     /// 长按后进入“拿起”状态；松手时放下并更新位置/顺序
@@ -289,6 +291,10 @@ pub struct DeckRefApp {
     view_offset: egui::Vec2,
     /// 视图缩放（内容移近/移远），1.0 = 100%；未拿起图片时滚轮调节，一览时重置为 1.0
     view_scale: f32,
+    /// true = 阵列排列，false = 一览打散；默认 true，启动时首帧应用阵列
+    grid_view: bool,
+    /// 当前卡片列表是否已做过首次排列（切换目录/模式后重置，首帧再应用 grid_view）
+    initial_arrange_done: bool,
     /// 设置面板是否打开
     settings_open: bool,
     /// 反转中键平移方向（为 true 时与默认相反，用于适应不同习惯）
@@ -407,6 +413,7 @@ impl DeckRefApp {
             },
             recent_folder_cards: std::collections::HashMap::new(),
             stack_layout: StackLayout::default(),
+            last_stack_size: egui::Vec2::new(600.0, 400.0),
             sort_order: CardSortOrder::default(),
             long_press: None,
             picked_up: None,
@@ -415,6 +422,8 @@ impl DeckRefApp {
             drag_pending: None,
             view_offset: egui::Vec2::ZERO,
             view_scale: 1.0,
+            grid_view: true,
+            initial_arrange_done: false,
             settings_open: false,
             invert_pan: loaded.invert_pan,
             allow_drag_out: loaded.allow_drag_out,
@@ -507,6 +516,8 @@ impl DeckRefApp {
                 }
             }
         }
+
+        self.initial_arrange_done = false;
 
         #[cfg(windows)]
         {
@@ -617,6 +628,8 @@ impl DeckRefApp {
         self.held_scale = None;
         self.drag_pending = None;
 
+        self.initial_arrange_done = false;
+
         if let Some(cached) = self.recent_folder_cards.remove(&watch_path) {
             self.cards = cached;
             if let Some(rx) = self.loading_rx.take() {
@@ -700,6 +713,7 @@ impl DeckRefApp {
                     if let Some(h) = self.loading_handle.take() {
                         let _ = h.join();
                     }
+                    self.initial_arrange_done = false;
                     break;
                 }
             }
@@ -1125,6 +1139,7 @@ impl DeckRefApp {
         }
         self.view_scale = 1.0;
         self.view_offset = egui::Vec2::ZERO;
+        self.grid_view = false;
     }
 
     /// 阵列排列：按原比例无缝紧密排列（类似股市热力图），行内无缝隙、行间无缝隙，填满可用区域。
@@ -1227,6 +1242,7 @@ impl DeckRefApp {
 
         self.view_scale = 1.8;
         self.view_offset = egui::Vec2::ZERO;
+        self.grid_view = true;
     }
 
     fn run_ui(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -1413,9 +1429,16 @@ impl DeckRefApp {
             .show(ctx, |ui| {
                 let stack_rect = ui.available_rect_before_wrap();
                 if stack_rect.is_positive() {
-                    self.stack_layout.available_size = stack_rect.size();
+                    self.last_stack_size = stack_rect.size();
                     let screen_center = stack_rect.center();
                     let n = self.cards.len();
+                    if n > 0 && !self.initial_arrange_done {
+                        self.initial_arrange_done = true;
+                        self.stack_layout.available_size = stack_rect.size();
+                        if self.grid_view {
+                            self.grid_arrange();
+                        }
+                    }
 
                     // 中键拖拽平移视角（方向可由设置中的「反转平移方向」切换）
                     let middle_down = ui.input(|i| i.pointer.middle_down());
@@ -1790,7 +1813,15 @@ impl DeckRefApp {
                                             continue;
                                         }
                                         let s = path.display().to_string();
-                                        let truncate = if s.len() > 45 { format!("…{}", &s[s.len().saturating_sub(44)..]) } else { s.clone() };
+                                        let truncate = if s.len() > 45 {
+                                            let mut start = s.len().saturating_sub(44);
+                                            while start < s.len() && !s.is_char_boundary(start) {
+                                                start += 1;
+                                            }
+                                            format!("…{}", &s[start..])
+                                        } else {
+                                            s.clone()
+                                        };
                                         if ui.button(truncate).on_hover_text(s).clicked() {
                                             self.navigate_watch_path(path.clone(), true);
                                             ui.close_menu();
@@ -2019,18 +2050,20 @@ impl DeckRefApp {
                     egui::Layout::left_to_right(egui::Align::Center).with_cross_justify(true),
                     |ui| {
                         if ui
-                            .button(egui::RichText::new("一览").size(13.0))
-                            .on_hover_text("将图片打散并均匀分布，快速浏览文件夹内容")
-                            .clicked()
-                        {
-                            self.scatter_spread();
-                        }
-                        if ui
-                            .button(egui::RichText::new("阵列").size(13.0))
+                            .selectable_label(self.grid_view, egui::RichText::new("阵列").size(13.0))
                             .on_hover_text("按网格、原比例排列，快速观看全貌；之后仍可自由拖动")
                             .clicked()
                         {
+                            self.stack_layout.available_size = self.last_stack_size;
                             self.grid_arrange();
+                        }
+                        if ui
+                            .selectable_label(!self.grid_view, egui::RichText::new("一览").size(13.0))
+                            .on_hover_text("将图片打散并均匀分布，快速浏览文件夹内容")
+                            .clicked()
+                        {
+                            self.stack_layout.available_size = self.last_stack_size;
+                            self.scatter_spread();
                         }
                         // 右侧：左键点住某张图时显示该图完整文件名，以及始终显示版本号（半透明灰色）
                         ui.with_layout(

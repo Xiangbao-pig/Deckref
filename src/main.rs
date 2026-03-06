@@ -1,4 +1,7 @@
 //! DeckRef 入口：置顶透明窗口，初始化 eframe，处理错误，不使用 unwrap。
+//! Windows 下使用 GUI 子系统，避免运行 exe 时弹出控制台窗口。
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use deckref::{AppError, DeckRefApp};
 use eframe::egui;
