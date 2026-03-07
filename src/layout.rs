@@ -27,7 +27,7 @@ pub struct LayoutCard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeckRefLayout {
     pub version: u32,
-    /// 保存时内容区尺寸 [宽, 高]，用于加载时按当前窗口比例缩放位置与缩放
+    /// 保存时内容区尺寸 [宽, 高]。画板模式视为**画布固定尺寸**（BOARD_MODE_OPTIMIZATION）：仅定义画布范围，加载后位置/缩放为画布绝对值，**不**随窗口 Resize 缩放。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_available_size: Option<[f32; 2]>,
     pub cards: Vec<LayoutCard>,
@@ -104,9 +104,7 @@ fn path_relative_to(base: &Path, full: &Path) -> String {
     }
 }
 
-/// 根据布局重排并应用每卡的 offset/rotation/scale；布局中不存在的卡片按原顺序追加到末尾并保留默认值。
-/// 若 layout 带 reference_available_size 且 current_available_size 为 Some，则按比例缩放 offset 与 scale；
-/// 否则不在此处缩放，由调用方在首帧获得真实画布尺寸后再缩放（见 layout_reference_size）。
+/// 根据布局重排并应用每卡的 offset/rotation/scale。画板模式（reference_available_size 存在）时：位置与缩放为**画布绝对值**，不按 current_available_size 缩放；其它模式可按比例缩放。
 pub fn apply_layout_to_cards(
     watch_path: &Path,
     cards: &mut Vec<ImageCard>,

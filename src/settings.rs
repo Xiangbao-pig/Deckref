@@ -14,6 +14,8 @@ pub struct AppSettings {
     pub allow_drag_out: bool,
     /// 预览专业格式图片（TGA、ICO、DDS、AVIF、EXR、HDR、PNM、QOI、PSD 等）
     pub preview_professional_formats: bool,
+    /// 框选方式：开 = AutoDesk 式（左→右 仅完全落入选框的选中，右→左 沾到即选中）；关 = 统一交叉选择（沾到即选中）
+    pub autodesk_style_selection: bool,
 }
 
 impl Default for AppSettings {
@@ -22,6 +24,7 @@ impl Default for AppSettings {
             invert_pan: false,
             allow_drag_out: true,
             preview_professional_formats: false,
+            autodesk_style_selection: false,
         }
     }
 }
@@ -56,10 +59,16 @@ pub fn load_settings() -> AppSettings {
         .and_then(|l| l.parse::<u8>().ok())
         .map(|n| n != 0)
         .unwrap_or(false);
+    let autodesk_style_selection = lines
+        .next()
+        .and_then(|l| l.parse::<u8>().ok())
+        .map(|n| n != 0)
+        .unwrap_or(false);
     AppSettings {
         invert_pan,
         allow_drag_out,
         preview_professional_formats,
+        autodesk_style_selection,
     }
 }
 
@@ -70,10 +79,11 @@ pub fn save_settings(s: &AppSettings) -> AppResult<()> {
         std::fs::create_dir_all(parent).map_err(AppError::Io)?;
     }
     let content = format!(
-        "{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n",
         if s.invert_pan { 1 } else { 0 },
         if s.allow_drag_out { 1 } else { 0 },
-        if s.preview_professional_formats { 1 } else { 0 }
+        if s.preview_professional_formats { 1 } else { 0 },
+        if s.autodesk_style_selection { 1 } else { 0 }
     );
     std::fs::write(&path, content).map_err(AppError::Io)?;
     Ok(())

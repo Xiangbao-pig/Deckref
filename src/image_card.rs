@@ -128,10 +128,20 @@ impl Default for StackLayout {
 impl StackLayout {
     /// 根据窗口与堆叠位置计算单张卡的显示尺寸：画面铺满，最前的图偏大。
     pub fn effective_display_size(&self, intrinsic_size: Vec2, index: usize, total: usize) -> Vec2 {
+        Self::effective_display_size_in_area(intrinsic_size, index, total, self.available_size)
+    }
+
+    /// 在指定区域尺寸下计算单张卡的显示尺寸（画板模式用固定画布尺寸，与当前窗口解耦）。
+    pub fn effective_display_size_in_area(
+        intrinsic_size: Vec2,
+        index: usize,
+        total: usize,
+        area_size: Vec2,
+    ) -> Vec2 {
         if total == 0 {
             return Vec2::new(220.0, 220.0);
         }
-        let min_side = self.available_size.x.min(self.available_size.y);
+        let min_side = area_size.x.min(area_size.y);
         let base_side = min_side * 0.45f32;
         let t = (index + 1) as f32 / total as f32;
         let stack_scale = 0.6 + 0.4 * t;
