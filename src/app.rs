@@ -12,6 +12,7 @@ use crate::mode::AppMode;
 use crate::settings;
 use crate::watcher::{list_existing_image_paths_with_metadata, list_existing_image_paths, WatchEvent, WatcherConfig};
 use crate::window_state;
+use crate::layout;
 use eframe::egui::{self, emath::Rot2, ColorImage, Rect, TextureHandle, Vec2};
 use rstar::{AABB, Envelope, RTree, RTreeObject};
 use std::collections::HashSet;
@@ -113,6 +114,60 @@ fn list_subdirs(path: &Path, limit: usize) -> Vec<PathBuf> {
     d.sort_by_cached_key(|p| p.file_name().unwrap_or_default().to_string_lossy().to_lowercase());
     d.truncate(limit);
     d
+}
+
+/// 面包屑单段按钮水平内边距（用于宽度估算）
+const BREADCRUMB_BTN_PADDING_X: f32 = 16.0;
+
+/// 计算面包屑在空间不足时从左侧折叠的起始索引（参考 Win11 资源管理器：保留右侧，左侧用省略号）。
+/// 当窗口足够长、可用宽度能容纳完整路径时，自动展开显示全部段落（start_index = 0）。
+/// 返回 (start_index, 各段宽度, 分隔符宽度, 省略号按钮宽度)。start_index > 0 时表示需显示 "…" 并只显示 segments[start_index..]。
+fn breadcrumb_collapse_start(
+    ui: &egui::Ui,
+    segments: &[(PathBuf, std::ffi::OsString)],
+    available_width: f32,
+) -> (usize, Vec<f32>, f32, f32) {
+    let font_id = egui::FontId::proportional(12.0);
+    let color = egui::Color32::PLACEHOLDER;
+    let sep_galley = ui.fonts(|f| f.layout_no_wrap(" › ".to_string(), font_id.clone(), color));
+    let sep_w = sep_galley.size().x;
+    let ellipsis_galley = ui.fonts(|f| f.layout_no_wrap("…".to_string(), font_id.clone(), color));
+    let ellipsis_btn_w = ellipsis_galley.size().x + BREADCRUMB_BTN_PADDING_X;
+
+    let mut seg_widths = Vec::with_capacity(segments.len());
+    for (_, label) in segments.iter() {
+        let s = label.to_string_lossy().to_string();
+        let galley = ui.fonts(|f| f.layout_no_wrap(s, font_id.clone(), color));
+        seg_widths.push(galley.size().x + BREADCRUMB_BTN_PADDING_X);
+    }
+
+    let n = segments.len();
+    if n == 0 {
+        return (0, seg_widths, sep_w, ellipsis_btn_w);
+    }
+
+    let full_width: f32 = seg_widths.iter().sum::<f32>() + (n as f32 - 1.0) * sep_w;
+    let avail = (available_width - 4.0).max(20.0);
+    if full_width <= avail {
+        return (0, seg_widths, sep_w, ellipsis_btn_w);
+    }
+
+    let mut start_index = 0;
+    for start in 0..n {
+        let mut w = if start > 0 { ellipsis_btn_w + sep_w } else { 0.0 };
+        for i in start..n {
+            w += seg_widths[i];
+            if i < n - 1 {
+                w += sep_w;
+            }
+        }
+        if w <= avail {
+            start_index = start;
+        } else {
+            break;
+        }
+    }
+    (start_index, seg_widths, sep_w, ellipsis_btn_w)
 }
 
 /// 用于视口剔除：卡片在屏幕空间的 AABB + 索引。先经 R-Tree 查询与视口相交的卡，再对查询结果做可见比例判断。
@@ -223,6 +278,15 @@ fn run_loader_thread(
                 }
             }
         }
+        AppMode::Board => {
+            let list = list_existing_image_paths_with_metadata(&watch_path, MAX_CARDS, extended_formats)
+                .unwrap_or_default();
+            for (path, file_size, modified) in list {
+                if let Ok((w, h)) = image_ops::image_dimensions(&path) {
+                    send(path, w, h, file_size, modified);
+                }
+            }
+        }
     }
     drop(tx);
 }
@@ -251,6 +315,7 @@ pub struct DeckRefApp {
     /// 切换模式时保留另一模式的卡片列表，再次切回时直接恢复，避免重扫磁盘与卡顿
     cached_default_cards: Option<Vec<ImageCard>>,
     cached_inspiration_cards: Option<Vec<ImageCard>>,
+    cached_board_cards: Option<Vec<ImageCard>>,
     texture_cache: std::collections::HashMap<PathBuf, TextureHandle>,
     /// 纹理缓存对应的文件夹路径（按最近使用顺序，前新后旧）；超过 MAX_TEXTURE_CACHE_FOLDERS 时淘汰最旧文件夹的全部纹理。
     texture_cache_scope: Vec<PathBuf>,
@@ -348,6 +413,16 @@ pub struct DeckRefApp {
     texture_loading_rx: Option<mpsc::Receiver<(PathBuf, Vec<u8>, u32, u32)>>,
     /// 纹理加载线程 handle，进程退出时 drop 即可
     _texture_loading_handle: Option<thread::JoinHandle<()>>,
+    /// 画板模式：上次成功写入布局的时间（秒），用于防抖保存
+    last_board_layout_save_time: f64,
+    /// 画板模式：加载的布局若带 reference_available_size，首帧用当前画布尺寸按比例缩放位置与缩放后清除
+    layout_reference_size: Option<egui::Vec2>,
+    /// 画板模式专用视口：缩放倍率（1.0=100%），仅画板模式读写，与默认/灵感完全解耦
+    board_view_scale: f32,
+    /// 画板模式专用视口：平移偏移（世界坐标），仅画板模式读写
+    board_view_offset: egui::Vec2,
+    /// 画板模式：上一帧内容区中心（屏幕坐标），用于窗口 resize 时补偿 offset 使画布中心不跳动
+    last_board_screen_center: Option<egui::Vec2>,
     /// 已请求但尚未收到结果的 path，避免重复请求；切换文件夹/清空时清空
     pending_texture_paths: HashSet<PathBuf>,
 }
@@ -387,6 +462,7 @@ impl DeckRefApp {
             cards: Vec::new(),
             cached_default_cards: None,
             cached_inspiration_cards: None,
+            cached_board_cards: None,
             texture_cache: std::collections::HashMap::new(),
             texture_cache_scope: Vec::new(),
             base_path,
@@ -452,6 +528,11 @@ impl DeckRefApp {
             texture_loading_tx,
             texture_loading_rx,
             _texture_loading_handle,
+            last_board_layout_save_time: 0.0,
+            layout_reference_size: None,
+            board_view_scale: 1.0,
+            board_view_offset: egui::Vec2::ZERO,
+            last_board_screen_center: None,
             pending_texture_paths: HashSet::new(),
         };
         app.start_async_load();
@@ -463,15 +544,32 @@ impl DeckRefApp {
         if self.mode == new_mode {
             return;
         }
+        // 离开画板前保存当前画板布局与路径，并同步到默认/画板两处（易用性：两模式文件夹同步）
+        if self.mode == AppMode::Board && !self.cards.is_empty() {
+            let path = PathBuf::from(&self.watch_path);
+            let _ = layout::save_layout(&path, &self.cards, self.last_stack_size);
+            let _ = window_state::save_last_folder_sync(&path);
+        }
         // 将当前模式的卡片列表存入对应缓存
         let old_mode = self.mode;
         match old_mode {
             AppMode::Default => self.cached_default_cards = Some(std::mem::take(&mut self.cards)),
             AppMode::Inspiration => self.cached_inspiration_cards = Some(std::mem::take(&mut self.cards)),
+            AppMode::Board => self.cached_board_cards = Some(std::mem::take(&mut self.cards)),
         }
 
         let _ = new_mode.ensure_dir(&self.base_path);
-        let watch_path = new_mode.watch_path(&self.base_path);
+        let watch_path = if new_mode == AppMode::Board {
+            window_state::load_last_board_path()
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(|| new_mode.watch_path(&self.base_path))
+        } else if new_mode == AppMode::Default {
+            window_state::load_last_default_path()
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(|| new_mode.watch_path(&self.base_path))
+        } else {
+            new_mode.watch_path(&self.base_path)
+        };
         let (tx, rx) = mpsc::channel();
         let config = WatcherConfig {
             watch_path: watch_path.clone(),
@@ -484,10 +582,13 @@ impl DeckRefApp {
         }
         self.watch_path = watch_path.display().to_string();
         self.mode = new_mode;
-        if new_mode == AppMode::Default {
+        if new_mode == AppMode::Default || new_mode == AppMode::Board {
             self.nav_history = vec![watch_path.clone()];
             self.nav_index = 0;
-            self.push_recent_folder(watch_path);
+            self.push_recent_folder(watch_path.clone());
+            if watch_path.is_dir() {
+                let _ = window_state::save_last_folder_sync(&watch_path);
+            }
         }
         self.address_bar_editing = false;
         self.long_press = None;
@@ -498,6 +599,9 @@ impl DeckRefApp {
         self.recent_drop_paths.clear();
         // 不清空 texture_cache，切回时已解码的纹理可直接复用，避免卡顿
         self.recent_drag_out_paths.clear();
+        if new_mode == AppMode::Board {
+            self.last_board_screen_center = None;
+        }
 
         // 从缓存恢复或从磁盘加载（恢复时克隆一份，保留缓存供下次切回使用）
         match new_mode {
@@ -511,6 +615,14 @@ impl DeckRefApp {
             AppMode::Inspiration => {
                 if let Some(ref c) = self.cached_inspiration_cards {
                     self.cards = c.clone();
+                } else {
+                    self.start_async_load();
+                }
+            }
+            AppMode::Board => {
+                if let Some(ref c) = self.cached_board_cards {
+                    self.cards = c.clone();
+                    self.apply_board_layout_if_present();
                 } else {
                     self.start_async_load();
                 }
@@ -574,10 +686,10 @@ impl DeckRefApp {
         }
     }
 
-    /// 默认模式下切换到指定目录：更新监听路径、重启 watcher、重新加载该目录图片。仅当路径存在且为目录时生效。
+    /// 默认/画板模式下切换到指定目录：更新监听路径、重启 watcher、重新加载该目录图片。仅当路径存在且为目录时生效。
     /// `add_to_history`：为 true 时写入前进/返回历史（点击面包屑、选子目录）；为 false 时仅跳转（后退/前进按钮）。
     fn navigate_watch_path(&mut self, new_path: PathBuf, add_to_history: bool) {
-        if self.mode != AppMode::Default {
+        if self.mode != AppMode::Default && self.mode != AppMode::Board {
             return;
         }
         if !new_path.is_dir() {
@@ -607,7 +719,12 @@ impl DeckRefApp {
     /// 若目标路径在 recent_folder_cards 中则直接恢复卡片，否则清空并异步加载。
     fn apply_watch_path(&mut self, watch_path: PathBuf) {
         let old_path = PathBuf::from(&self.watch_path);
-        if self.mode == AppMode::Default && self.recent_folders.iter().any(|p| *p == old_path) {
+        // 画板模式切换目录前保存当前目录布局，并同步到默认/画板两处路径（易用性：两模式文件夹同步）
+        if self.mode == AppMode::Board && !self.cards.is_empty() {
+            let _ = layout::save_layout(&old_path, &self.cards, self.last_stack_size);
+            let _ = window_state::save_last_folder_sync(&old_path);
+        }
+        if (self.mode == AppMode::Default || self.mode == AppMode::Board) && self.recent_folders.iter().any(|p| *p == old_path) {
             self.recent_folder_cards.insert(old_path, self.cards.clone());
         }
 
@@ -622,6 +739,9 @@ impl DeckRefApp {
             self.watch_rx = rx;
         }
         self.watch_path = watch_path.display().to_string();
+        if (self.mode == AppMode::Default || self.mode == AppMode::Board) && watch_path.is_dir() {
+            let _ = window_state::save_last_folder_sync(&watch_path);
+        }
         self.long_press = None;
         self.picked_up = None;
         self.held_smooth_pos = None;
@@ -632,6 +752,9 @@ impl DeckRefApp {
 
         if let Some(cached) = self.recent_folder_cards.remove(&watch_path) {
             self.cards = cached;
+            if self.mode == AppMode::Board {
+                self.apply_board_layout_if_present();
+            }
             if let Some(rx) = self.loading_rx.take() {
                 drop(rx);
             }
@@ -660,9 +783,24 @@ impl DeckRefApp {
         }
     }
 
+    /// 画板模式：若当前目录存在 .deckref_layout.json 则加载并应用到 cards（顺序与每卡 offset/rotation/scale）；
+    /// 若布局带 reference_available_size 则设置 layout_reference_size，首帧绘制时再按当前画布尺寸缩放。
+    fn apply_board_layout_if_present(&mut self) {
+        if self.mode != AppMode::Board || self.cards.is_empty() {
+            return;
+        }
+        let watch_path = PathBuf::from(&self.watch_path);
+        if let Some(layout) = layout::load_layout(&watch_path) {
+            layout::apply_layout_to_cards(&watch_path, &mut self.cards, &layout, None);
+            if let Some(ref_sz) = layout.reference_available_size {
+                self.layout_reference_size = Some(egui::Vec2::new(ref_sz[0], ref_sz[1]));
+            }
+        }
+    }
+
     /// 默认模式下后退到上一个目录；无历史则无操作。
     fn nav_back(&mut self) {
-        if self.mode != AppMode::Default || self.nav_index == 0 {
+        if (self.mode != AppMode::Default && self.mode != AppMode::Board) || self.nav_index == 0 {
             return;
         }
         self.nav_index -= 1;
@@ -672,7 +810,7 @@ impl DeckRefApp {
 
     /// 默认模式下前进到下一个目录；无历史则无操作。
     fn nav_forward(&mut self) {
-        if self.mode != AppMode::Default {
+        if self.mode != AppMode::Default && self.mode != AppMode::Board {
             return;
         }
         if self.nav_index >= self.nav_history.len().saturating_sub(1) {
@@ -712,6 +850,9 @@ impl DeckRefApp {
                     self.loading_rx = None;
                     if let Some(h) = self.loading_handle.take() {
                         let _ = h.join();
+                    }
+                    if self.mode == AppMode::Board {
+                        self.apply_board_layout_if_present();
                     }
                     self.initial_arrange_done = false;
                     break;
@@ -1139,6 +1280,10 @@ impl DeckRefApp {
         }
         self.view_scale = 1.0;
         self.view_offset = egui::Vec2::ZERO;
+        if self.mode == AppMode::Board {
+            self.board_view_scale = 1.0;
+            self.board_view_offset = egui::Vec2::ZERO;
+        }
         self.grid_view = false;
     }
 
@@ -1237,7 +1382,17 @@ impl DeckRefApp {
                 let eff_y = effective.y.max(1e-6);
                 let display_scale = (w / eff_x).min(row_h / eff_y);
                 card.display_scale = display_scale.clamp(DISPLAY_SCALE_MIN, DISPLAY_SCALE_MAX);
+                // 画板模式：将阵列的世界坐标写入参考空间，使显示使用 board_saved_world_pos 且与保存一致
+                if self.mode == AppMode::Board {
+                    card.board_saved_world_pos = Some(world_center);
+                }
             }
+        }
+
+        if self.mode == AppMode::Board {
+            self.layout_reference_size = Some(self.stack_layout.available_size);
+            self.board_view_scale = 1.8;
+            self.board_view_offset = egui::Vec2::ZERO;
         }
 
         self.view_scale = 1.8;
@@ -1417,6 +1572,7 @@ impl DeckRefApp {
                     resp.on_hover_text(match m {
                         AppMode::Default => "默认模式：监听主文件夹中的图片",
                         AppMode::Inspiration => "灵感模式：展示最近使用的图片与 Ref/Screenshots 截图；按下 Shift 后约 5 秒内截屏会自动保存并显示",
+                        AppMode::Board => "画板模式：画布布局持久化到当前目录的 .deckref_layout.json；切换目录或重启后恢复",
                     });
                     ui.add_space(6.0);
                 }
@@ -1432,28 +1588,81 @@ impl DeckRefApp {
                     self.last_stack_size = stack_rect.size();
                     let screen_center = stack_rect.center();
                     let n = self.cards.len();
+                    if n == 0 {
+                        let msg = "当前文件夹中没有可以预览的图片";
+                        let gray = egui::Color32::from_rgba_unmultiplied(90, 90, 90, 240);
+                        let galley = ui.painter().layout_no_wrap(
+                            msg.into(),
+                            egui::FontId::proportional(15.0),
+                            gray,
+                        );
+                        let padding = 14.0;
+                        let frame_size = galley.size() + egui::Vec2::splat(2.0 * padding);
+                        let frame_rect = egui::Rect::from_center_size(stack_rect.center(), frame_size);
+                        ui.painter().rect_filled(
+                            frame_rect,
+                            egui::Rounding::same(6.0),
+                            egui::Color32::from_rgba_unmultiplied(250, 250, 250, 40),
+                        );
+                        ui.painter().rect_stroke(
+                            frame_rect,
+                            egui::Rounding::same(6.0),
+                            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(140, 140, 140, 220)),
+                        );
+                        let text_pos = frame_rect.center() - galley.size() / 2.0;
+                        ui.painter().galley(text_pos, galley, gray);
+                    }
                     if n > 0 && !self.initial_arrange_done {
                         self.initial_arrange_done = true;
                         self.stack_layout.available_size = stack_rect.size();
-                        if self.grid_view {
+                        if self.mode != AppMode::Board && self.grid_view {
+                            self.grid_arrange();
+                        } else if self.mode == AppMode::Board && self.grid_view && self.layout_reference_size.is_none() {
+                            // 画板模式且无已加载布局时也做首帧阵列，避免新目录下阵列不生效
                             self.grid_arrange();
                         }
                     }
 
-                    // 中键拖拽平移视角（方向可由设置中的「反转平移方向」切换）
+                    // 画板模式专用：窗口 resize 时补偿 offset，使画布中心对应的世界点仍停留在新中心，不跳动
+                    if self.mode == AppMode::Board {
+                        if let Some(prev) = self.last_board_screen_center {
+                            let delta = screen_center.to_vec2() - prev;
+                            if delta.length_sq() > 1e-8 {
+                                self.board_view_offset -= delta / self.board_view_scale;
+                            }
+                        }
+                    }
+
+                    // 中键拖拽平移视角（默认/灵感用 view_offset；画板用 board_view_offset，与另两模式解耦）
                     let middle_down = ui.input(|i| i.pointer.middle_down());
                     let pointer_delta = ui.input(|i| i.pointer.delta());
                     if middle_down && pointer_delta != egui::Vec2::ZERO {
                         let delta = if self.invert_pan { pointer_delta } else { -pointer_delta };
-                        self.view_offset += delta;
+                        if self.mode == AppMode::Board {
+                            self.board_view_offset += delta;
+                        } else {
+                            self.view_offset += delta;
+                        }
+                    }
+                    // 画板模式：空格+左键拖动 = 平移画布（复刻 PS），不触发长按拿起；方向与中键一致（受「反转平移方向」影响）
+                    if self.mode == AppMode::Board {
+                        let space_held = ui.input(|i| i.key_down(egui::Key::Space));
+                        if space_held && ui.input(|i| i.pointer.primary_down()) && pointer_delta != egui::Vec2::ZERO {
+                            let delta = if self.invert_pan { pointer_delta } else { -pointer_delta };
+                            self.board_view_offset += delta;
+                        }
                     }
 
                     let pointer = ui.input(|i| i.pointer.hover_pos());
                     let pointer_down = ui.input(|i| i.pointer.primary_down());
                     let pointer_released = ui.input(|i| i.pointer.primary_released());
 
-                    let view_offset = self.view_offset;
-                    let view_scale = self.view_scale;
+                    // 视口状态：画板用 board_view_*（世界坐标+缩放），默认/灵感用 view_offset/view_scale，互不影响
+                    let (view_offset, view_scale) = if self.mode == AppMode::Board {
+                        (self.board_view_offset, self.board_view_scale)
+                    } else {
+                        (self.view_offset, self.view_scale)
+                    };
                     let world_to_screen = |w: egui::Pos2| {
                         let v = w.to_vec2() - view_offset;
                         egui::Pos2::new(
@@ -1469,37 +1678,88 @@ impl DeckRefApp {
                         egui::Pos2::new(view_offset.x + v.x, view_offset.y + v.y)
                     };
 
-                    // 未拿起任何图片时：滚轮缩放整个视图（移近/移远），以指针位置为缩放中心
+                    // 未拿起任何图片时：滚轮缩放整个视图（以指针为中心，缩放前后指针下的世界点保持在同一屏幕位置）
                     if self.picked_up.is_none() {
                         let scroll = ui.input(|i| i.raw_scroll_delta).y;
                         if scroll != 0.0 {
                             let world_before = pointer.map(|p| screen_to_world(p).to_vec2());
-                            self.view_scale = (self.view_scale * (1.0 + scroll * VIEW_ZOOM_SENSITIVITY))
-                                .clamp(VIEW_SCALE_MIN, VIEW_SCALE_MAX);
-                            if let (Some(ptr), Some(wb)) = (pointer, world_before) {
-                                let s_center = screen_center.to_vec2();
-                                self.view_offset = wb - (ptr.to_vec2() - s_center) / self.view_scale;
+                            if self.mode == AppMode::Board {
+                                let s1 = self.board_view_scale;
+                                self.board_view_scale = (s1 * (1.0 + scroll * VIEW_ZOOM_SENSITIVITY))
+                                    .clamp(VIEW_SCALE_MIN, VIEW_SCALE_MAX);
+                                let s2 = self.board_view_scale;
+                                if let (Some(ptr), Some(_wb)) = (pointer, world_before) {
+                                    let rel = ptr.to_vec2() - screen_center.to_vec2();
+                                    self.board_view_offset += rel * (1.0 / s1 - 1.0 / s2);
+                                }
+                            } else {
+                                self.view_scale = (self.view_scale * (1.0 + scroll * VIEW_ZOOM_SENSITIVITY))
+                                    .clamp(VIEW_SCALE_MIN, VIEW_SCALE_MAX);
+                                if let (Some(ptr), Some(wb)) = (pointer, world_before) {
+                                    let s_center = screen_center.to_vec2();
+                                    self.view_offset = wb - (ptr.to_vec2() - s_center) / self.view_scale;
+                                }
                             }
                         }
                     }
 
                     // 命中检测（从最前到最后），使用世界坐标；拿起中的卡片不参与悬停
+                    // 仅画板模式使用 board_scale_u / board_saved_world_pos；默认与灵感模式始终走 else 分支，与画板解耦。
                     let picked_up_index = self.picked_up.as_ref().map(|(i, _, _)| *i);
+                    let board_scale_u = if self.mode == AppMode::Board && n > 0 {
+                        self.layout_reference_size.filter(|r| r.x > 0.0 && r.y > 0.0).map(|ref_sz| {
+                            let cur = self.last_stack_size;
+                            if cur.x > 0.0 && cur.y > 0.0 {
+                                (cur.x / ref_sz.x + cur.y / ref_sz.y) / 2.0
+                            } else {
+                                1.0
+                            }
+                        }).unwrap_or(1.0)
+                    } else {
+                        1.0
+                    };
+                    let card_display: Vec<(egui::Vec2, f32, f32)> = (0..n)
+                        .map(|i| {
+                            let card = &self.cards[i];
+                        let (pos, scale_eff) = if self.mode == AppMode::Board {
+                            // 画板模式：有持久化世界坐标则按参考空间缩放；否则用堆叠+偏移（如阵列后或新目录）
+                            card.board_saved_world_pos.map(|saved| {
+                                    let p = saved * board_scale_u + card.anim_position_delta;
+                                    let s = (card.display_scale * board_scale_u).clamp(DISPLAY_SCALE_MIN, DISPLAY_SCALE_MAX);
+                                    (p, s)
+                                }).unwrap_or_else(|| {
+                                    let (lp, _) = self.stack_layout.position_and_rotation(i, n);
+                                    (lp.to_vec2() + card.random_offset + card.anim_position_delta, card.display_scale)
+                                })
+                            } else {
+                                let (lp, _) = self.stack_layout.position_and_rotation(i, n);
+                                (lp.to_vec2() + card.random_offset + card.anim_position_delta, card.display_scale)
+                            };
+                            let pos = if Some(i) == picked_up_index && self.held_smooth_pos.is_some() {
+                                self.held_smooth_pos.unwrap_or(pos)
+                            } else {
+                                pos
+                            };
+                            let (_, rot) = self.stack_layout.position_and_rotation(i, n);
+                            let rot = rot + card.random_rotation + card.anim_rotation_offset;
+                            let scale_eff = if Some(i) == picked_up_index { self.held_scale.unwrap_or(scale_eff) } else { scale_eff };
+                            (pos, rot, scale_eff)
+                        })
+                        .collect();
+
                     let mut hovered_index = None;
                     let world_pointer = pointer.map(screen_to_world);
                     for i in (0..n).rev() {
                         if Some(i) == picked_up_index {
                             continue;
                         }
+                        let (world_pos, rot, scale_eff) = card_display[i];
                         let card = &self.cards[i];
-                        let (world_pos, rot) = self.stack_layout.position_and_rotation(i, n);
-                        let world_pos = world_pos + card.random_offset + card.anim_position_delta;
-                        let rot = rot + card.random_rotation + card.anim_rotation_offset;
                         let size = self.stack_layout.effective_display_size(card.intrinsic_size, i, n);
-                        let size = size * card.display_scale;
+                        let size = size * scale_eff;
                         let half = size / 2.0;
                         if let Some(wp) = world_pointer {
-                            if rotated_rect_contains(world_pos, half, rot, wp) {
+                            if rotated_rect_contains(egui::Pos2::new(world_pos.x, world_pos.y), half, rot, wp) {
                                 hovered_index = Some(i);
                                 break;
                             }
@@ -1536,22 +1796,10 @@ impl DeckRefApp {
                     );
                     let mut rects: Vec<CardScreenRect> = Vec::with_capacity(n);
                     for (i, card) in self.cards.iter().enumerate() {
-                        let (world_pos, rot) = self.stack_layout.position_and_rotation(i, n);
-                        let world_center = if Some(i) == picked_up_index {
-                            self.held_smooth_pos
-                                .map(|v| egui::Pos2::new(v.x, v.y))
-                                .unwrap_or(world_pos + card.random_offset + card.anim_position_delta)
-                        } else {
-                            world_pos + card.random_offset + card.anim_position_delta
-                        };
-                        let rot = rot + card.random_rotation + card.anim_rotation_offset;
+                        let (world_pos, rot, scale_eff) = card_display[i];
+                        let world_center = egui::Pos2::new(world_pos.x, world_pos.y);
                         let size = self.stack_layout.effective_display_size(card.intrinsic_size, i, n);
-                        let scale = if Some(i) == picked_up_index {
-                            self.held_scale.unwrap_or(1.0)
-                        } else {
-                            card.display_scale
-                        };
-                        let size = size * scale * view_scale;
+                        let size = size * scale_eff;
                         let half = size / 2.0;
                         let aabb = screen_aabb_for_rotated_rect(world_center, half, rot, &world_to_screen);
                         rects.push(CardScreenRect { index: i, aabb });
@@ -1604,12 +1852,10 @@ impl DeckRefApp {
                         if !visible_indices.contains(&i) {
                             continue;
                         }
-                        let (world_pos, rot) = self.stack_layout.position_and_rotation(i, n);
-                        let world_pos = world_pos + card.random_offset + card.anim_position_delta;
-                        let rot = rot + card.random_rotation + card.anim_rotation_offset;
-                        let screen_pos = world_to_screen(world_pos);
+                        let (world_pos, rot, scale_eff) = card_display[i];
+                        let screen_pos = world_to_screen(egui::Pos2::new(world_pos.x, world_pos.y));
                         let size = self.stack_layout.effective_display_size(card.intrinsic_size, i, n);
-                        let size = size * card.display_scale * view_scale;
+                        let size = size * scale_eff * view_scale;
                         if let Some(tex) = self.texture_cache.get(&card.path) {
                             let uv = Rect::from_min_max([0.0, 0.0].into(), [1.0, 1.0].into());
                             draw_card(
@@ -1664,16 +1910,15 @@ impl DeckRefApp {
                     if self.picked_up.is_none() && self.long_press.is_some() {
                         if let Some((idx, start)) = self.long_press {
                             if ctx.input(|i| i.time) - start >= LONG_PRESS_DURATION as f64 {
-                                let (world_pos, _rot) = self.stack_layout.position_and_rotation(idx, n);
-                                let card = &self.cards[idx];
-                                let card_world = world_pos + card.random_offset + card.anim_position_delta;
+                                let (world_pos, _, _) = card_display[idx];
+                                let card_world = egui::Pos2::new(world_pos.x, world_pos.y);
                                 let grab_offset_world = world_pointer
                                     .map(|wp| wp.to_vec2() - card_world.to_vec2())
                                     .unwrap_or(egui::Vec2::ZERO);
                                 let now = ctx.input(|i| i.time);
                                 self.picked_up = Some((idx, grab_offset_world, now));
                                 self.held_smooth_pos = Some(card_world.to_vec2());
-                                self.held_scale = Some(card.display_scale);
+                                self.held_scale = Some(card_display[idx].2);
                                 self.long_press = None;
                                 if self.allow_drag_out {
                                     self.drag_pending = Some(idx); // 拿起后指针离开窗口边缘时发起系统拖出
@@ -1710,21 +1955,31 @@ impl DeckRefApp {
                             let drop_world = world_pointer
                                 .map(|wp| wp.to_vec2() - grab_offset_world)
                                 .unwrap_or(egui::Vec2::ZERO);
-                            // 放下后卡片会置顶，故偏移应相对“最前一张”的布局位置；并记录旋转差用于落定动画
+                            let in_board = self.mode == AppMode::Board && self.layout_reference_size.is_some();
+                            let board_scale_u_drop = if in_board && n > 0 {
+                                self.layout_reference_size.filter(|r| r.x > 0.0 && r.y > 0.0).map(|ref_sz| {
+                                    let cur = self.last_stack_size;
+                                    if cur.x > 0.0 && cur.y > 0.0 {
+                                        (cur.x / ref_sz.x + cur.y / ref_sz.y) / 2.0
+                                    } else {
+                                        1.0
+                                    }
+                                }).unwrap_or(1.0)
+                            } else {
+                                1.0
+                            };
                             let (layout_front, new_layout_rot) = self.stack_layout.position_and_rotation(n.saturating_sub(1), n);
                             let (_, old_layout_rot) = self.stack_layout.position_and_rotation(idx, n);
                             let new_offset = drop_world - layout_front.to_vec2();
-                            // 放下时：用当前视觉总旋转作为落定起点，目标为竖直，避免阵列下出现大角度旋转
                             let current_total_rot = if let Some(card) = self.cards.get(idx) {
                                 old_layout_rot + card.random_rotation + card.anim_rotation_offset
                             } else {
                                 old_layout_rot - new_layout_rot
                             };
-                            // 在 bring_to_front 前记录所有卡片的当前世界坐标与总旋转角，以便重排后恢复其余卡片位置和朝向
                             let old_world_pos: Vec<egui::Vec2> = (0..n)
                                 .map(|i| {
-                                    let (lp, _) = self.stack_layout.position_and_rotation(i, n);
-                                    lp.to_vec2() + self.cards[i].random_offset + self.cards[i].anim_position_delta
+                                    let (pos, _, _) = card_display[i];
+                                    pos
                                 })
                                 .collect();
                             let old_layout_rots: Vec<f32> = (0..n)
@@ -1734,19 +1989,31 @@ impl DeckRefApp {
                                 .map(|i| old_layout_rots[i] + self.cards[i].random_rotation + self.cards[i].anim_rotation_offset)
                                 .collect();
                             if let Some(card) = self.cards.get_mut(idx) {
-                                card.random_offset = new_offset;
-                                card.display_scale = scale;
+                                if in_board {
+                                    let drop_ref = drop_world / board_scale_u_drop;
+                                    let scale_ref = (scale / board_scale_u_drop).clamp(DISPLAY_SCALE_MIN, DISPLAY_SCALE_MAX);
+                                    card.board_saved_world_pos = Some(drop_ref);
+                                    card.random_offset = drop_ref;
+                                    card.display_scale = scale_ref;
+                                } else {
+                                    card.random_offset = new_offset;
+                                    card.display_scale = scale;
+                                }
                                 card.random_rotation = -new_layout_rot;
                                 card.anim_rotation_offset = normalize_angle_delta(current_total_rot);
                             }
                             self.bring_to_front(idx);
-                            // 重排后：被移动的卡片现在在 n-1，其余前移的卡片需补偿位置和旋转，使视觉不变
                             for i in idx..(n - 1) {
                                 let (new_lp, new_layout_rot) = self.stack_layout.position_and_rotation(i, n);
                                 let new_lp = new_lp.to_vec2();
-                                self.cards[i].random_offset = old_world_pos[i + 1] - new_lp;
+                                if in_board {
+                                    let ref_pos = old_world_pos[i + 1] / board_scale_u_drop;
+                                    self.cards[i].board_saved_world_pos = Some(ref_pos);
+                                    self.cards[i].random_offset = ref_pos;
+                                } else {
+                                    self.cards[i].random_offset = old_world_pos[i + 1] - new_lp;
+                                }
                                 self.cards[i].anim_position_delta = egui::Vec2::ZERO;
-                                // 保持总旋转角不变，否则 layout_rot 随索引变化会导致未移动的卡“看起来在转”
                                 self.cards[i].anim_rotation_offset = normalize_angle_delta(
                                     old_total_rots[i + 1] - new_layout_rot - self.cards[i].random_rotation,
                                 );
@@ -1759,7 +2026,10 @@ impl DeckRefApp {
                         if self.picked_up.is_none() {
                             if let Some(idx) = hovered_index {
                                 if self.long_press.is_none() {
-                                    self.long_press = Some((idx, ctx.input(|i| i.time)));
+                                    let space_held = self.mode == AppMode::Board && ctx.input(|i| i.key_down(egui::Key::Space));
+                                    if !space_held {
+                                        self.long_press = Some((idx, ctx.input(|i| i.time)));
+                                    }
                                 }
                             } else {
                                 self.long_press = None;
@@ -1769,6 +2039,9 @@ impl DeckRefApp {
                     } else if hovered_index.is_none() && self.picked_up.is_none() {
                         self.long_press = None;
                         self.drag_pending = None;
+                    }
+                    if self.mode == AppMode::Board {
+                        self.last_board_screen_center = Some(screen_center.to_vec2());
                     }
                 }
             });
@@ -1796,7 +2069,7 @@ impl DeckRefApp {
                     bg,
                 );
                 ui.horizontal(|ui| {
-                    if self.mode == AppMode::Default {
+                    if self.mode == AppMode::Default || self.mode == AppMode::Board {
                         let recent = self.recent_folders.clone();
                         let current_path = PathBuf::from(&self.watch_path);
                         egui::menu::menu_button(ui, "最近访问", |ui| {
@@ -1834,7 +2107,7 @@ impl DeckRefApp {
                         .on_hover_text("最近到访的 5 个文件夹，点击快速切换（有缓存）");
                         ui.separator();
                     }
-                    if self.mode == AppMode::Default {
+                    if self.mode == AppMode::Default || self.mode == AppMode::Board {
                         if ui.input(|i| i.key_pressed(egui::Key::L) && (i.modifiers.ctrl || i.modifiers.mac_cmd)) {
                             ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L));
                             ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::L));
@@ -1886,13 +2159,53 @@ impl DeckRefApp {
                             let watch_path_buf = PathBuf::from(&self.watch_path);
                             let segments = path_breadcrumbs(&watch_path_buf);
                             let arrow_color = ui.visuals().weak_text_color();
+                            let screen_w = ui.ctx().screen_rect().width();
+                            const RESERVE_LEFT_RIGHT: f32 = 280.0;
+                            let avail_breadcrumb = (screen_w - RESERVE_LEFT_RIGHT).max(40.0);
+                            let (start_index, _seg_widths, _sep_w, _ellipsis_btn_w) =
+                                breadcrumb_collapse_start(ui, &segments, avail_breadcrumb);
 
-                            egui::ScrollArea::horizontal()
-                                .id_salt("addr_bar_breadcrumb")
-                                .max_height(TOP_BAR_HEIGHT - 8.0)
-                                .show(ui, |ui| {
+                            let _ = ui.allocate_ui_with_layout(
+                                egui::Vec2::new(avail_breadcrumb, TOP_BAR_HEIGHT),
+                                egui::Layout::left_to_right(egui::Align::Min),
+                                |ui| {
+                                    egui::ScrollArea::horizontal()
+                                        .id_salt("addr_bar_breadcrumb")
+                                        .max_height(TOP_BAR_HEIGHT - 4.0)
+                                        .show(ui, |ui| {
                                     ui.horizontal(|ui| {
+                                        if start_index > 0 {
+                                            let resp = egui::menu::menu_button(
+                                                ui,
+                                                egui::RichText::new("…").size(12.0).color(arrow_color),
+                                                |ui| {
+                                                    ui.set_max_width(280.0);
+                                                    ui.set_max_height(200.0);
+                                                    egui::ScrollArea::vertical().show(ui, |ui| {
+                                                        for (path, label) in segments.iter().take(start_index) {
+                                                            let label_str = label.to_string_lossy();
+                                                            if ui.button(label_str.as_ref()).clicked() {
+                                                                if path.as_os_str() != THIS_PC_SENTINEL
+                                                                    && path.is_dir()
+                                                                {
+                                                                    self.navigate_watch_path(path.clone(), true);
+                                                                }
+                                                                ui.close_menu();
+                                                            }
+                                                        }
+                                                    });
+                                                },
+                                            );
+                                            if resp.response.hovered() {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                            }
+                                            resp.response.on_hover_text("被省略的上级路径，点击可跳转");
+                                            ui.add(egui::Label::new(egui::RichText::new(" › ").color(arrow_color)).selectable(false));
+                                        }
                                         for (i, (path, label)) in segments.iter().enumerate() {
+                                            if i < start_index {
+                                                continue;
+                                            }
                                             let is_sentinel = path.as_os_str() == THIS_PC_SENTINEL;
                                             let is_current = i == segments.len() - 1;
                                             let label_str = label.to_string_lossy();
@@ -1967,11 +2280,13 @@ impl DeckRefApp {
                                         }
                                     });
                                 });
+                            }
+                            );
 
                             let blank_id = egui::Id::new("addr_blank");
                             let avail = ui.available_width();
                             if avail > 4.0 {
-                                let blank_resp = ui.allocate_ui(egui::Vec2::new(avail, TOP_BAR_HEIGHT - 8.0), |ui| {
+                                let blank_resp = ui.allocate_ui(egui::Vec2::new(avail, TOP_BAR_HEIGHT), |ui| {
                                     let rect = ui.available_rect_before_wrap();
                                     ui.interact(rect, blank_id, egui::Sense::click())
                                 });
@@ -2195,11 +2510,29 @@ impl DeckRefApp {
             self.held_scale = None;
         }
 
+        // 画板模式：每约 5 秒防抖写入一次布局到 .deckref_layout.json
+        if self.mode == AppMode::Board && !self.cards.is_empty() {
+            let now = ctx.input(|i| i.time);
+            if self.last_board_layout_save_time == 0.0 {
+                self.last_board_layout_save_time = now;
+            } else if now - self.last_board_layout_save_time >= 5.0 {
+                let path = std::path::Path::new(&self.watch_path);
+                if path.is_dir() {
+                    let _ = layout::save_layout(path, &self.cards, self.last_stack_size);
+                    self.last_board_layout_save_time = now;
+                }
+            }
+        }
+
         // 仅在需要连续重绘时请求 repaint，避免每帧强制重绘导致透明窗口抖动。
-        // 包含缩放/平移：一览与阵列都会重置 view，之后用户仍可滚轮缩放、中键平移，必须持续重绘才能生效。
+        // 包含缩放/平移：画板用 board_view_*，默认/灵感用 view_*，一览与阵列会重置对应 view。
+        let view_needs_repaint = if self.mode == AppMode::Board {
+            (self.board_view_scale - 1.0).abs() > 1e-6 || self.board_view_offset.length_sq() > 1e-6
+        } else {
+            (self.view_scale - 1.0).abs() > 1e-6 || self.view_offset.length_sq() > 1e-6
+        };
         let needs_continuous_repaint = self.picked_up.is_some()
-            || (self.view_scale - 1.0).abs() > 1e-6
-            || self.view_offset.length_sq() > 1e-6
+            || view_needs_repaint
             || self.cards.iter().any(|c| {
                 c.anim_position_delta.length_sq() > 1e-8
                     || c.anim_rotation_offset.abs() > 1e-6
@@ -2215,7 +2548,20 @@ impl Drop for DeckRefApp {
     fn drop(&mut self) {
         if self.mode == AppMode::Default {
             if !self.watch_path.is_empty() && self.watch_path != THIS_PC_SENTINEL {
-                let _ = window_state::save_last_default_path(std::path::Path::new(&self.watch_path));
+                let path = std::path::Path::new(&self.watch_path);
+                if path.is_dir() {
+                    let _ = window_state::save_last_folder_sync(path);
+                }
+            }
+            let _ = window_state::save_recent_folders(&self.recent_folders);
+        }
+        if self.mode == AppMode::Board {
+            if !self.watch_path.is_empty() && !self.cards.is_empty() {
+                let path = std::path::Path::new(&self.watch_path);
+                let _ = layout::save_layout(path, &self.cards, self.last_stack_size);
+                if path.is_dir() {
+                    let _ = window_state::save_last_folder_sync(path);
+                }
             }
             let _ = window_state::save_recent_folders(&self.recent_folders);
         }

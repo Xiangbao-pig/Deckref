@@ -8,6 +8,17 @@
 
 ## 未发布
 
+- **2025-03-03** 修复：窗口变窄时面包屑未自动省略左侧；并修复地址栏与「最近访问」「按大小/按修改时间/清空」垂直不对齐。地址栏区域改为与工具栏同高（`TOP_BAR_HEIGHT`）、顶对齐（`Align::Min`），右侧预留增至 280 以容纳排列/清空按钮并保证窄窗下折叠。涉及：`src/app.rs`（地址栏 allocate 高度与对齐、RESERVE_LEFT_RIGHT、空白区高度）。
+- **2025-03-03** 易用性：地址栏在窗口拉长后自动展开——当可用宽度足以显示完整路径时，面包屑自动显示全部段落，不再显示省略号。涉及：`src/app.rs`（`breadcrumb_collapse_start` 先判完整宽度再决定是否折叠）、`docs/INTERACTIONS.md`。
+- **2025-03-03** 易用性：面包屑地址栏过长时（大于窗口宽度）左侧自动折叠为省略号「…」，保留右侧路径可见（参考 Win11 资源管理器）；点击「…」可展开被省略的上级路径并跳转。涉及：`src/app.rs`（`breadcrumb_collapse_start`、地址栏渲染）、`docs/INTERACTIONS.md`。
+- **2025-03-03** 易用性：默认模式与画板模式的文件夹地址同步——切换目录或切换模式时同时写入 `last_path.txt` 与 `last_board_path.txt`，切到默认或画板均打开同一文件夹；两模式仍模块化（各自存储文件与布局逻辑）。涉及：`src/window_state.rs`（`save_last_folder_sync`）、`src/app.rs`（`apply_watch_path`、`switch_mode`、`Drop`）、`docs/INTERACTIONS.md`。
+- **2025-03-07** 画板模式专用视口逻辑（复刻 Photoshop，仅画板、不影响默认/灵感）：维护三个坐标系（世界坐标、视口状态 scale/offset、屏幕坐标）；缩放以鼠标为中心、公式 `offset += (鼠标屏 - 中心)×(1/s1 - 1/s2)` 不跳动；平移为中键或空格+左键拖动，Delta 累加至 offset；窗口 resize 时补偿中心位移到 offset，画布中心不跳动。独立状态 `board_view_scale` / `board_view_offset` / `last_board_screen_center`，一览/阵列在画板下重置 board_view_*。涉及：`src/app.rs`（画板视口字段、resize 补偿、pan/zoom 分支、空格+左键不触发长按）、`docs/INTERACTIONS.md`（画板视口小节）。
+- **2025-03-07** 画板模式与默认/灵感解耦 + 画板下阵列修复：确认画板逻辑仅在 `mode == AppMode::Board` 时生效（board_scale_u、board_saved_world_pos、参考空间读写）；默认与灵感模式始终使用 stack + random_offset，不读 board_saved_world_pos。画板模式下点击「阵列」或首帧无布局时：在 `grid_arrange` 中为每卡写入 `board_saved_world_pos = Some(world_center)` 并设置 `layout_reference_size = stack_layout.available_size`，使阵列显示与保存一致且随窗口缩放。涉及：`src/app.rs`（card_display 注释、grid_arrange 内 Board 分支、首帧阵列条件）。
+- **2025-03-07** 画板模式缩放与切文件夹后间距修复：布局以「参考画布尺寸」下的绝对世界坐标保存（`reference_available_size` + 每卡 offset/scale 为参考空间）；每帧用 `board_scale_u = 当前画布/参考画布` 统一缩放位置与缩放，绕画布原点整体缩放，位置与间距比例一致。不再首帧 `take()` 掉 `layout_reference_size`，切到别文件夹改窗口再切回后，相对间距随当前窗口正确缩放。`ImageCard` 新增 `board_saved_world_pos`；加载时 `use_board_absolute` 只写参考空间；保存与放下、重排时在画板模式下读写参考空间。涉及：`src/layout.rs`（apply 分 use_board_absolute 两路、layout_from_cards 用 board_saved_world_pos）、`src/image_card.rs`（board_saved_world_pos）、`src/app.rs`（board_scale_u、card_display 预计算、命中/R-Tree/绘制/拿起/放下统一用 card_display，放下与重排写参考空间）。
+- **2025-03-07** 画板模式布局随窗口比例缩放（初版）：保存布局时写入 `reference_available_size`，加载后根据当前画布尺寸比例缩放每卡的 offset 与 display_scale。涉及：`src/layout.rs`、`src/app.rs`（layout_reference_size、保存时传入 last_stack_size）。（后续由「参考空间 + 每帧 scale_u」方案替代，见上一条。）
+- **2025-03-07** 0.3.0 Phase 1：画板模式与布局持久化。新增第三模式「画板」，左侧边栏三入口；画板模式下画布与当前目录绑定，在该目录内写入 `.deckref_layout.json`（卡片 position/scale/order），进入/切换目录时若存在则加载；退出、切换目录或约每 5 秒防抖写回；成功写入的目录路径追加到配置目录 `layout_dirs.txt` 供卸载时安全清理。画板模式支持地址栏与最近到访、后退/前进，上次画板目录持久化于 `last_board_path.txt`。涉及：`src/mode.rs`（AppMode::Board）、`src/layout.rs`（新建）、`src/window_state.rs`（last_board_path、append_layout_dir）、`src/app.rs`（画板加载/保存/防抖、缓存）、`docs/INTERACTIONS.md`、`CHANGELOG.md`。
+- **2025-03-07** 图标可来自 assets：若存在 `assets/icon.png` 或 `assets/main icon.png`，构建时从中生成 `wix/DeckRef.ico`（32×32/16×16）并嵌入 exe 与 MSI；否则仍使用内置程序绘制 logo。打包脚本版本号改为优先从 `cargo pkgid` 读取，保证与 Cargo.toml 一致。涉及：`build.rs`（`build_icon_from_png`、回退 `build_icon_fallback`）、`Cargo.toml`（build-dependencies image）、`scripts/build_windows.ps1`（版本解析）。
+- **2025-03-07** Windows 图标注册：MSI 与 exe 均使用统一 logo。构建时 `build.rs` 生成 `wix/DeckRef.ico`（32×32/16×16）并用 **winres** 嵌入 exe，资源管理器/任务栏/快捷方式显示图标；WiX 中注册 **ARPPRODUCTICON** 与快捷方式 **Icon**，「添加/删除程序」与开始菜单显示 logo。涉及：`build.rs`、`Cargo.toml`（build、winres、ico）、`wix/DeckRef.wxs`（Icon、ARPPRODUCTICON、Shortcut Icon）、`scripts/build_windows.ps1`（复制 DeckRef.ico）、`docs/BUILD_WINDOWS.md`。
 - **2025-03-05** Windows 打包 v0.1.4：产物改为 **名称+版本号** 文件夹 `DeckRef-0.1.4`，内含 exe、使用说明、config_readme、卸载.bat；可选生成 MSI（需安装 WiX Toolset v3.11）。卸载脚本保留「是否清理 DeckRef 产生的缓存」选项，选 N 则下次安装可继续使用。Cargo.toml 版本设为 0.1.4。涉及：`Cargo.toml`、`scripts/build_windows.ps1`、`scripts/install_readme_win.txt`、`docs/BUILD_WINDOWS.md`、`.gitignore`（DeckRef-*）。
 - **2025-03-03** 底部栏右下角显示版本号（半透明灰色）与左键点住图片时显示该图完整文件名。涉及：`src/app.rs`、`docs/INTERACTIONS.md`。
 - **2025-03-02** 阵列（热力图式）紧密排列：阵列改为按原比例、无缝紧密排列（类似股市热力图）。行内与行间无缝隙，每行等高、按 aspect 贪心分行，整体缩放填满可用区域；内边距改为 4px。涉及：`src/app.rs`（`grid_arrange` 行式无缝排布、row_boundaries、display_scale 按矩形宽高计算）。
@@ -55,9 +66,20 @@
 
 ## 已发布
 
+### [0.3.0] - 2025-03-07
+
+- **画板模式**：新增第三模式「画板」，左侧三入口；画板下画布与当前目录绑定，目录内 `.deckref_layout.json` 持久化卡片位置/缩放/顺序，进入或切换目录时自动加载，退出或约每 5 秒防抖写回；`last_board_path.txt`、`layout_dirs.txt` 记录画板目录与布局目录供清理。
+- **画板视口**：画板专用缩放与平移（世界/视口/屏幕三坐标系），缩放以鼠标为中心不跳动，中键或空格+左键平移；窗口 resize 时补偿中心；一览/阵列在画板下重置视口；布局以参考画布尺寸保存，每帧按 `board_scale_u` 统一缩放。
+- **地址栏**：面包屑过长时左侧折叠为「…」、点击可展开；窗口拉长后自动展开完整路径；与工具栏同高、顶对齐，窄窗下折叠；默认与画板模式文件夹地址同步（`last_path.txt` / `last_board_path.txt`）。
+- **构建与图标**：`build.rs` 从 assets 生成 `wix/DeckRef.ico` 并嵌入 exe（winres）；打包脚本版本号从 `cargo pkgid` 读取；新增 `docs/PRODUCT_ROADMAP_0.3.md`。
+- **依赖**：serde、serde_json（布局序列化）；build-dependencies：winres、ico、image。
+
+（此前若有版本发布，可在此按版本/时间罗列。）
+
 ### [0.2.0] - 2025-03-05
 
-- **Windows 打包**：产物文件夹改为 **DeckRef-{版本号}**（如 `DeckRef-0.2.0`），内含 exe、使用说明、config_readme、Uninstall.bat；可选生成 MSI 安装包（需安装 WiX Toolset v3.11，`wix/DeckRef.wxs`）。
+- **Windows 打包**：产物文件夹改为 **DeckRef-{版本号}**（如 `DeckRef-0.2.0`），内含 exe、使用说明、config_readme、Uninstall.bat；可选生成 MSI 安装包（需安装 WiX Toolset v3.11，`wix/DeckRef.wxs`）。版本号优先从 `cargo pkgid` 读取，与 Cargo.toml 一致。
+- **图标**：支持从 **assets/icon.png** 或 **assets/main icon.png** 在构建时生成 `wix/DeckRef.ico`（32×32/16×16）并嵌入 exe 与 MSI；若无则使用内置绘制 logo。`build.rs` + winres + ico。
 - **界面**：底部栏右下角显示版本号（半透明）；左键点住图片时显示该图完整文件名。
 - **阵列**：热力图式紧密排列，按原比例无缝、行内/行间无缝隙，行等高、按宽高比贪心分行，整体缩放填满可用区域。
 - **安全**：新增 `SECURITY.md` 漏洞报告策略。

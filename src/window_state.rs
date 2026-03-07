@@ -3,6 +3,7 @@
 //! 同时提供全局最小尺寸限制，避免窗口被缩得过小无法操作。
 
 use crate::error::{AppError, AppResult};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 默认窗口内宽（与 main.rs ViewportBuilder 一致）
@@ -204,4 +205,66 @@ pub fn save_recent_folders(paths: &[PathBuf]) -> AppResult<()> {
 /// 应用级最小内尺寸，用于 ViewportBuilder::with_min_inner_size。
 pub fn min_inner_size() -> [f32; 2] {
     [MIN_INNER_WIDTH, MIN_INNER_HEIGHT]
+}
+
+/// 画板模式「上次监听目录」的存储文件名（与 window.txt 同目录）。
+fn last_board_path_file() -> AppResult<PathBuf> {
+    Ok(config_dir()?.join("last_board_path.txt"))
+}
+
+/// 读取上次画板模式监听的目录路径；无文件或路径无效时返回 None。
+pub fn load_last_board_path() -> Option<PathBuf> {
+    let path = last_board_path_file().ok()?;
+    let s = std::fs::read_to_string(&path).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(s);
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// 保存画板模式当前监听目录，供下次启动或切回画板时恢复。
+pub fn save_last_board_path(path: &Path) -> AppResult<()> {
+    let file = last_board_path_file()?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(AppError::Io)?;
+    }
+    let s = path.display().to_string();
+    std::fs::write(&file, s).map_err(AppError::Io)?;
+    Ok(())
+}
+
+/// 易用性：将当前文件夹同时写入默认模式与画板模式的「上次路径」，使两模式切换时看到同一目录。
+/// 仍保持两模式各自独立的存储文件与逻辑，仅在此处做一次双写同步。
+pub fn save_last_folder_sync(path: &Path) -> AppResult<()> {
+    save_last_default_path(path)?;
+    save_last_board_path(path)?;
+    Ok(())
+}
+
+/// 画板布局目录登记文件（每行一个规范路径），供卸载时可选清理 .deckref_layout.json。
+fn layout_dirs_file() -> AppResult<PathBuf> {
+    Ok(config_dir()?.join("layout_dirs.txt"))
+}
+
+/// 将某目录的规范路径追加到 layout_dirs.txt；成功写入布局后调用，供卸载时安全清理。
+pub fn append_layout_dir(canonical_path: &Path) -> AppResult<()> {
+    let file = layout_dirs_file()?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(AppError::Io)?;
+    }
+    let line = canonical_path.display().to_string() + "\n";
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .map_err(AppError::Io)?
+        .write_all(line.as_bytes())
+        .map_err(AppError::Io)?;
+    Ok(())
 }

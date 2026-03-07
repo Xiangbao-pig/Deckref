@@ -4,6 +4,7 @@ pub mod app;
 pub mod error;
 pub mod image_card;
 pub mod image_ops;
+pub mod layout;
 pub mod mode;
 pub mod settings;
 pub mod watcher;

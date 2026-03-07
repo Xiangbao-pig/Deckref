@@ -25,6 +25,8 @@ pub struct ImageCard {
     pub anim_rotation_offset: f32,
     /// 位置插值偏移（世界坐标），打散/移动时向零收敛，实现平滑位移动画
     pub anim_position_delta: Vec2,
+    /// 画板模式：在参考画布尺寸下的绝对世界坐标中心；Some 时每帧用 saved*scale_u 整体缩放
+    pub board_saved_world_pos: Option<Vec2>,
 }
 
 impl ImageCard {
@@ -85,6 +87,7 @@ impl ImageCard {
             display_scale: 1.0,
             anim_rotation_offset: 0.0,
             anim_position_delta: Vec2::ZERO,
+            board_saved_world_pos: None,
         }
     }
 }

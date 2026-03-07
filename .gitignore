@@ -3,6 +3,8 @@
 /ANzhuang
 /DeckRef-*
 **/*.rs.bk
+/wix/DeckRef.ico
+/wix/obj/
 
 # 环境与敏感信息（切勿提交）
 .env

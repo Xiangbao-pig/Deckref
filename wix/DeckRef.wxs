@@ -3,12 +3,16 @@
   <Product Id="*"
            Name="DeckRef"
            Language="2052"
+           Codepage="936"
            Version="$(var.Version)"
            Manufacturer="DeckRef"
            UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
     <MajorUpgrade DowngradeErrorMessage="已安装更高版本，无法降级。" />
     <MediaTemplate EmbedCab="yes" />
+    <!-- 产品图标：用于「添加/删除程序」、开始菜单快捷方式等 -->
+    <Icon Id="DeckRefIcon" SourceFile="$(var.SourceDir)\DeckRef.ico" />
+    <Property Id="ARPPRODUCTICON" Value="DeckRefIcon" />
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFilesFolder">
         <Directory Id="INSTALLDIR" Name="DeckRef" FileSource="$(var.SourceDir)">
@@ -36,7 +40,9 @@
                   Name="DeckRef"
                   Description="DeckRef 图片参考板"
                   Target="[#DeckRefExe]"
-                  WorkingDirectory="INSTALLDIR" />
+                  WorkingDirectory="INSTALLDIR"
+                  Icon="DeckRefIcon"
+                  IconIndex="0" />
         <RemoveFolder Id="AppProgramMenuDir" On="uninstall" />
         <RegistryValue Root="HKCU" Key="Software\DeckRef" Name="installed" Type="integer" Value="1" KeyPath="yes" />
       </Component>
