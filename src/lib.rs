@@ -1,6 +1,7 @@
 //! DeckRef 应用库：UI、文件监听、图片处理模块化分离。
 
 pub mod app;
+mod app_shell_layout;
 mod app_nav;
 mod app_threads;
 mod app_viewport;

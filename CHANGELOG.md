@@ -8,7 +8,11 @@
 
 ## 未发布
 
-- **2026-05-07** 重构（阶段 1）：将 `app.rs` 中的纯函数与线程入口拆至 `app_nav.rs`（面包屑/盘符/子目录）、`app_threads.rs`（异步加载与纹理解码线程）、`app_viewport.rs`（R-Tree 卡片 AABB 与 `screen_aabb_for_rotated_rect`）；行为不变。涉及：`src/lib.rs`、`src/app.rs`、新建上述三模块、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+- **2026-05-07** 修复（Windows）：地址栏面包屑在盘符段使用 `F:` 而非 `F:\`，点击「F:」会进入该盘**当前工作目录**（若进程曾在 `F:\deckref` 下操作则表现为跳进 deckref），无法稳定回到盘根。现于 `path_breadcrumbs` 在 `Prefix` 后合并 `RootDir`，并在 `navigate_watch_path` / 地址栏 Enter 对单独盘符做规范化。涉及：`src/app_nav.rs`、`src/app/mod.rs`、`src/app/ui_top_bar.rs`。
+
+- **2026-05-07** 重构（阶段 2）：三层壳 UI 抽至 `app` 子模块 `ui_mode_sidebar`、`ui_top_bar`、`ui_bottom_bar`；布局常量归 `app_shell_layout.rs`；原 `src/app.rs` 改为 `src/app/mod.rs`。`run_ui` 调用顺序与原先一致（侧栏 → 中央 → 顶栏 → 底栏）。涉及：`src/lib.rs`、`src/app/`、`src/app_shell_layout.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+
+- **2026-05-07** 重构（阶段 1）：将应用内纯函数与线程入口拆至 `app_nav.rs`、`app_threads.rs`、`app_viewport.rs`；主应用入口现为 `src/app/mod.rs`（阶段 2 起）。行为不变。涉及：`src/lib.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
 
 - **2025-03-07** 画板模式拖左/上边时图片不再跟边移动：resize 补偿改用**物理屏幕坐标**（viewport.outer_rect.min + 内容区中心），与窗口相对坐标解耦；拖左/上边时窗口在物理屏上移动，中心物理位置变化，补偿正确生效。涉及：`src/app.rs`（board_screen_center_for_compensation、last_board_screen_center 存物理中心）。
 - **2025-03-07** 画板模式与窗口完全解耦复查：① 无布局时卡片基准尺寸用固定 `BOARD_DEFAULT_CANVAS_SIZE`(600×400)，不再用当前 `available_size`。② 保存布局时画板模式传入 `layout_reference_size.unwrap_or(last_stack_size)` 作为画布尺寸，避免因当前窗口缩小而覆盖画布尺寸。涉及：`src/app.rs`（BOARD_DEFAULT_CANVAS_SIZE、board_ref_size、4 处 save_layout 的 canvas_size）。
