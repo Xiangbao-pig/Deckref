@@ -21,6 +21,9 @@
 - **main.rs**：入口、窗口选项、CJK 字体加载、`DeckRefApp` 创建
 - **build.rs**（仅 Windows 构建）：从 `assets/icon.png` 或 `assets/main icon.png` 生成 `wix/DeckRef.ico` 并嵌入 exe（winres）；若无则内置绘制 logo。MSI 打包使用同一 ico。
 - **app.rs**：应用状态、UI 主循环、事件轮询、纹理缓存、卡片列表与交互
+- **app_nav.rs**（`crate` 内私有模块）：地址栏面包屑、盘符列表、折叠宽度计算
+- **app_threads.rs**：后台卡片列表扫描（`deckref-loader`）、纹理解码线程（`deckref-tex-loader`）入口
+- **app_viewport.rs**：视口剔除用 `CardScreenRect`、旋转矩形屏幕 AABB 计算
 - **watcher.rs**：目录扫描、防抖监听、通过 channel 发送 `WatchEvent`
 - **image_ops.rs**：`load_image`、`image_dimensions`、`save_image`、缩略图与后台解码（纯函数式接口，无内部缓存）
 - **image_card.rs**：`ImageCard` 结构、堆叠布局、命中检测、绘制（mesh/阴影）、动画插值

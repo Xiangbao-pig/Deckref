@@ -1,5 +1,10 @@
 //! UI 逻辑：堆叠照片、纹理缓存、悬停/长按/排序。
 
+use crate::app_nav::{
+    breadcrumb_collapse_start, list_drives_windows, list_subdirs, path_breadcrumbs,
+    THIS_PC_SENTINEL,
+};
+use crate::app_viewport::{screen_aabb_for_rotated_rect, CardScreenRect};
 use crate::error::AppResult;
 use crate::board_view;
 use crate::image_card::{
@@ -11,15 +16,14 @@ use crate::image_card::{
 use crate::image_ops;
 use crate::mode::AppMode;
 use crate::settings;
-use crate::watcher::{list_existing_image_paths_with_metadata, list_existing_image_paths, WatchEvent, WatcherConfig};
+use crate::watcher::{list_existing_image_paths, WatchEvent, WatcherConfig};
 use crate::window_state;
 use crate::layout;
-use eframe::egui::{self, emath::Rot2, ColorImage, Rect, TextureHandle, Vec2};
-use rstar::{AABB, Envelope, RTree, RTreeObject};
+use eframe::egui::{self, ColorImage, Rect, TextureHandle, Vec2};
+use rstar::{AABB, Envelope, RTree};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf, Component};
-use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::SystemTime;
@@ -50,261 +54,10 @@ const RECENT_FOLDERS_MAX: usize = 5;
 const MAX_TEXTURE_CACHE_FOLDERS: usize = 10;
 /// 右键拖动移动窗口：超过该距离（像素）才视为「移动窗口」而非右键点击，与 PureRef 的 Move window threshold 思路一致
 const RIGHT_DRAG_MOVE_THRESHOLD: f32 = 4.0;
-/// 面包屑根「此台电脑」的占位路径，不参与真实导航，仅用于展开盘符列表（Windows）
-const THIS_PC_SENTINEL: &str = "::THIS_PC::";
 /// 剪贴板截图轮询间隔（秒）：至少隔这么久才读一次剪贴板，避免过于频繁。1.0～1.5 更省资源，0.8 响应更快。
 const CLIPBOARD_POLL_INTERVAL: f64 = 0.8;
 /// 按下 Shift 后持续监听剪贴板截图的时长（秒）。手动截屏（如 Win+Shift+S）通常伴随 Shift，此时间内剪贴板新图会保存；超时后不再自动保存，避免误存 QQ/浏览器等复制的图片。
 const SHIFT_LISTENING_DURATION: f64 = 5.0;
-
-/// Windows：列出所有逻辑盘符路径（如 C:\、D:\）。
-#[cfg(windows)]
-fn list_drives_windows() -> Vec<PathBuf> {
-    use windows::Win32::Storage::FileSystem::GetLogicalDriveStringsW;
-    let mut buf = [0u16; 256];
-    unsafe {
-        let len = GetLogicalDriveStringsW(Some(&mut buf[..]));
-        if len == 0 {
-            return Vec::new();
-        }
-        let s = String::from_utf16_lossy(&buf[..len as usize]);
-        s.split('\0')
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .collect()
-    }
-}
-
-/// 将路径解析为面包屑：(完整路径, 显示名)，用于地址栏逐级点击导航。Windows 下首段为「此台电脑」以便选盘。
-fn path_breadcrumbs(path: &Path) -> Vec<(PathBuf, OsString)> {
-    let mut out = Vec::new();
-    let mut acc = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::Prefix(prefix) => {
-                acc.push(comp);
-                out.push((acc.clone(), prefix.as_os_str().to_owned()));
-            }
-            Component::RootDir => {
-                acc.push(comp);
-            }
-            Component::Normal(name) => {
-                acc.push(name);
-                out.push((acc.clone(), name.to_owned()));
-            }
-            _ => {
-                acc.push(comp);
-            }
-        }
-    }
-    #[cfg(windows)]
-    if !out.is_empty() {
-        out.insert(0, (PathBuf::from(THIS_PC_SENTINEL), OsString::from("此台电脑")));
-    }
-    out
-}
-
-/// 列出指定目录下的子文件夹（按名称排序，最多 limit 个）。用于面包屑每级右侧的下拉菜单。
-fn list_subdirs(path: &Path, limit: usize) -> Vec<PathBuf> {
-    let mut d: Vec<PathBuf> = match std::fs::read_dir(path) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.path())
-            .collect(),
-        Err(_) => return vec![],
-    };
-    d.sort_by_cached_key(|p| p.file_name().unwrap_or_default().to_string_lossy().to_lowercase());
-    d.truncate(limit);
-    d
-}
-
-/// 面包屑单段按钮水平内边距（用于宽度估算）
-const BREADCRUMB_BTN_PADDING_X: f32 = 16.0;
-
-/// 计算面包屑在空间不足时从左侧折叠的起始索引（参考 Win11 资源管理器：保留右侧，左侧用省略号）。
-/// 当窗口足够长、可用宽度能容纳完整路径时，自动展开显示全部段落（start_index = 0）。
-/// 返回 (start_index, 各段宽度, 分隔符宽度, 省略号按钮宽度)。start_index > 0 时表示需显示 "…" 并只显示 segments[start_index..]。
-fn breadcrumb_collapse_start(
-    ui: &egui::Ui,
-    segments: &[(PathBuf, std::ffi::OsString)],
-    available_width: f32,
-) -> (usize, Vec<f32>, f32, f32) {
-    let font_id = egui::FontId::proportional(12.0);
-    let color = egui::Color32::PLACEHOLDER;
-    let sep_galley = ui.fonts(|f| f.layout_no_wrap(" › ".to_string(), font_id.clone(), color));
-    let sep_w = sep_galley.size().x;
-    let ellipsis_galley = ui.fonts(|f| f.layout_no_wrap("…".to_string(), font_id.clone(), color));
-    let ellipsis_btn_w = ellipsis_galley.size().x + BREADCRUMB_BTN_PADDING_X;
-
-    let mut seg_widths = Vec::with_capacity(segments.len());
-    for (_, label) in segments.iter() {
-        let s = label.to_string_lossy().to_string();
-        let galley = ui.fonts(|f| f.layout_no_wrap(s, font_id.clone(), color));
-        seg_widths.push(galley.size().x + BREADCRUMB_BTN_PADDING_X);
-    }
-
-    let n = segments.len();
-    if n == 0 {
-        return (0, seg_widths, sep_w, ellipsis_btn_w);
-    }
-
-    let full_width: f32 = seg_widths.iter().sum::<f32>() + (n as f32 - 1.0) * sep_w;
-    let avail = (available_width - 4.0).max(20.0);
-    if full_width <= avail {
-        return (0, seg_widths, sep_w, ellipsis_btn_w);
-    }
-
-    let mut start_index = 0;
-    for start in 0..n {
-        let mut w = if start > 0 { ellipsis_btn_w + sep_w } else { 0.0 };
-        for i in start..n {
-            w += seg_widths[i];
-            if i < n - 1 {
-                w += sep_w;
-            }
-        }
-        if w <= avail {
-            start_index = start;
-        } else {
-            break;
-        }
-    }
-    (start_index, seg_widths, sep_w, ellipsis_btn_w)
-}
-
-/// 用于视口剔除：卡片在屏幕空间的 AABB + 索引。先经 R-Tree 查询与视口相交的卡，再对查询结果做可见比例判断。
-struct CardScreenRect {
-    index: usize,
-    aabb: AABB<[f64; 2]>,
-}
-impl RTreeObject for CardScreenRect {
-    type Envelope = AABB<[f64; 2]>;
-    fn envelope(&self) -> Self::Envelope {
-        self.aabb
-    }
-}
-
-/// 由世界坐标中心、半尺寸、旋转角与 world_to_screen 得到屏幕空间 AABB（用于可见比例计算）。
-fn screen_aabb_for_rotated_rect(
-    world_center: egui::Pos2,
-    half_size: egui::Vec2,
-    rot: f32,
-    world_to_screen: impl Fn(egui::Pos2) -> egui::Pos2,
-) -> AABB<[f64; 2]> {
-    let r = Rot2::from_angle(rot);
-    let corners = [
-        world_center + r * Vec2::new(half_size.x, half_size.y),
-        world_center + r * Vec2::new(-half_size.x, half_size.y),
-        world_center + r * Vec2::new(-half_size.x, -half_size.y),
-        world_center + r * Vec2::new(half_size.x, -half_size.y),
-    ];
-    let screen: Vec<egui::Pos2> = corners.iter().map(|&p| world_to_screen(p)).collect();
-    let min_x = screen.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
-    let min_y = screen.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
-    let max_x = screen.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
-    let max_y = screen.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
-    AABB::from_corners([min_x as f64, min_y as f64], [max_x as f64, max_y as f64])
-}
-fn run_loader_thread(
-    mode: AppMode,
-    watch_path: PathBuf,
-    screenshot_dir: PathBuf,
-    extended_formats: bool,
-    tx: mpsc::Sender<(PathBuf, (u32, u32), (u64, SystemTime))>,
-) {
-    let send = |path: PathBuf, w: u32, h: u32, file_size: u64, modified: SystemTime| {
-        let _ = tx.send((path, (w, h), (file_size, modified)));
-    };
-    match mode {
-        AppMode::Default => {
-            let list = list_existing_image_paths_with_metadata(&watch_path, MAX_CARDS, extended_formats)
-                .unwrap_or_default();
-            for (path, file_size, modified) in list {
-                if let Ok((w, h)) = image_ops::image_dimensions(&path) {
-                    send(path, w, h, file_size, modified);
-                }
-            }
-        }
-        AppMode::Inspiration => {
-            #[cfg(windows)]
-            {
-                let recent = crate::win_recent::list_recent_image_paths(INSPIRATION_RECENT_MAX, extended_formats);
-                let screenshots = image_ops::list_screenshot_paths_ordered(&screenshot_dir);
-                let mut paths: Vec<PathBuf> = recent;
-                for p in screenshots {
-                    if !paths.contains(&p) && paths.len() < INSPIRATION_RECENT_MAX {
-                        paths.push(p);
-                    }
-                }
-                paths.truncate(INSPIRATION_RECENT_MAX);
-                for path in paths {
-                    let (file_size, modified) = std::fs::metadata(&path)
-                        .map(|m| {
-                            (
-                                m.len(),
-                                m.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                            )
-                        })
-                        .unwrap_or((0, SystemTime::UNIX_EPOCH));
-                    if let Ok((w, h)) = image_ops::image_dimensions(&path) {
-                        send(path, w, h, file_size, modified);
-                    }
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                let mut paths: Vec<PathBuf> =
-                    list_existing_image_paths(&watch_path, extended_formats).unwrap_or_default();
-                for p in image_ops::list_screenshot_paths_ordered(&screenshot_dir) {
-                    if !paths.contains(&p) && paths.len() < INSPIRATION_RECENT_MAX {
-                        paths.push(p);
-                    }
-                }
-                paths.truncate(INSPIRATION_RECENT_MAX);
-                let list = paths
-                    .into_iter()
-                    .filter_map(|path| {
-                        std::fs::metadata(&path).ok().map(|m| {
-                            (
-                                path,
-                                m.len(),
-                                m.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                            )
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                for (path, file_size, modified) in list {
-                    if let Ok((w, h)) = image_ops::image_dimensions(&path) {
-                        send(path, w, h, file_size, modified);
-                    }
-                }
-            }
-        }
-        AppMode::Board => {
-            let list = list_existing_image_paths_with_metadata(&watch_path, MAX_CARDS, extended_formats)
-                .unwrap_or_default();
-            for (path, file_size, modified) in list {
-                if let Ok((w, h)) = image_ops::image_dimensions(&path) {
-                    send(path, w, h, file_size, modified);
-                }
-            }
-        }
-    }
-    drop(tx);
-}
-
-/// 后台纹理解码线程：从 req_rx 收 path，解码为 RGBA（大图缩略图），通过 res_tx 回传；主线程只做 GPU 上传。
-fn run_texture_loader_thread(
-    req_rx: mpsc::Receiver<PathBuf>,
-    res_tx: mpsc::Sender<(PathBuf, Vec<u8>, u32, u32)>,
-) {
-    for path in req_rx {
-        if let Ok((rgba, w, h)) = image_ops::load_image_rgba_for_texture(&path) {
-            let _ = res_tx.send((path, rgba, w, h));
-        }
-    }
-}
 
 /// 拿起状态：卡片索引 + 抓取时指针相对卡片中心的世界坐标偏移（用于跟手）
 /// 以及拿起时刻的时间（用于拿起动画插值）
@@ -464,7 +217,9 @@ impl DeckRefApp {
         let (tex_res_tx, tex_res_rx) = mpsc::channel();
         let tex_handle = thread::Builder::new()
             .name("deckref-tex-loader".into())
-            .spawn(move || run_texture_loader_thread(tex_req_rx, tex_res_tx));
+            .spawn(move || {
+                crate::app_threads::run_texture_loader_thread(tex_req_rx, tex_res_tx)
+            });
         let (texture_loading_tx, texture_loading_rx, _texture_loading_handle) = match tex_handle {
             Ok(h) => (Some(tex_req_tx), Some(tex_res_rx), Some(h)),
             Err(_) => (None, None, None),
@@ -694,7 +449,15 @@ impl DeckRefApp {
         let handle = thread::Builder::new()
             .name("deckref-loader".into())
             .spawn(move || {
-                run_loader_thread(mode, watch_path, screenshot_dir, extended_formats, tx);
+                crate::app_threads::run_loader_thread(
+                    mode,
+                    watch_path,
+                    screenshot_dir,
+                    extended_formats,
+                    MAX_CARDS,
+                    INSPIRATION_RECENT_MAX,
+                    tx,
+                );
             });
 
         match handle {
