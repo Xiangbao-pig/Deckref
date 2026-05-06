@@ -8,9 +8,6 @@
 
 ## 未发布
 
-- **2025-03-08** 修复：拿起一张并放下后，**其余**照片尺寸不再整体变小。原因：置顶后原在 idx+1..n-1 的卡片索引前移，基准尺寸变小且未补偿 display_scale。现对「被挤下去」的每张卡按 旧基准/新基准 放大 display_scale，保持视觉尺寸不变。涉及：`src/app.rs`（bring_to_front 后的 for 循环内补偿）。
-- **2025-03-08** 修复：拿起图片后放下时尺寸不再因置顶而变大。放下时根据「置顶前后」的布局基准尺寸换算 `display_scale`，使 新基准×新scale = 旧基准×旧scale，视觉尺寸保持不变；画板与默认/灵感模式均生效。涉及：`src/app.rs`（松手放下分支：old_effective/new_effective、new_scale）。
-- **2025-03-08** 修复：默认/灵感模式下拖边改变视窗大小时，所有图片不再整体移位。对 `view_offset` 做与画板模式一致的 resize 补偿（原先在内容区中心的世界点仍留在原屏幕位置），新增 `last_stack_screen_center` 与 `board_view::apply_resize_compensation` 的默认/灵感分支。涉及：`src/app.rs`（last_stack_screen_center、resize 补偿 else 分支、切换/清空时重置）。
 - **2025-03-07** 画板模式拖左/上边时图片不再跟边移动：resize 补偿改用**物理屏幕坐标**（viewport.outer_rect.min + 内容区中心），与窗口相对坐标解耦；拖左/上边时窗口在物理屏上移动，中心物理位置变化，补偿正确生效。涉及：`src/app.rs`（board_screen_center_for_compensation、last_board_screen_center 存物理中心）。
 - **2025-03-07** 画板模式与窗口完全解耦复查：① 无布局时卡片基准尺寸用固定 `BOARD_DEFAULT_CANVAS_SIZE`(600×400)，不再用当前 `available_size`。② 保存布局时画板模式传入 `layout_reference_size.unwrap_or(last_stack_size)` 作为画布尺寸，避免因当前窗口缩小而覆盖画布尺寸。涉及：`src/app.rs`（BOARD_DEFAULT_CANVAS_SIZE、board_ref_size、4 处 save_layout 的 canvas_size）。
 - **2025-03-07** 画板模式：图片在画布上的大小与窗口尺寸解耦。卡片显示尺寸改为用固定画布参考尺寸（`layout_reference_size`）计算，无布局时用当前 `available_size`；新增 `StackLayout::effective_display_size_in_area`，画板模式下命中/剔除/绘制均用 `board_ref_size`，窗口变小后进入同文件夹图片大小不再变化。涉及：`src/image_card.rs`（effective_display_size_in_area）、`src/app.rs`（board_ref_size、四处 effective_display_size 分支）。
@@ -73,6 +70,12 @@
 ---
 
 ## 已发布
+
+### [0.3.3] - 2025-03-08
+
+- **阵列与一览旋转分离**：阵列状态下抓取、放下或从外部拖入的图片均无旋转，且不会引起其他图片连带旋转；随机旋转仅在一览状态下存在。涉及：`src/app.rs`（card_display 与拿起绘制 rot、松手放下分支）、`docs/INTERACTIONS.md`。
+- **拿起放下尺寸修复**：拿起图片后放下时尺寸不再因置顶而变大（按置顶前后基准换算 display_scale）；拿起一张并放下后其余照片尺寸不再整体变小（对被挤下去的卡按旧/新基准补偿 display_scale）。涉及：`src/app.rs`（松手放下与 bring_to_front 后循环）。
+- **默认/灵感 resize 补偿**：拖边改变视窗大小时所有图片不再整体移位，对 view_offset 做与画板一致的中心位移补偿，新增 last_stack_screen_center。涉及：`src/app.rs`。
 
 ### [0.3.2] - 2025-03-09
 

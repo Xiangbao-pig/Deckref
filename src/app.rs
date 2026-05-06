@@ -1789,7 +1789,12 @@ impl DeckRefApp {
                                 pos
                             };
                             let (_, rot) = self.stack_layout.position_and_rotation(i, n);
-                            let rot = rot + card.random_rotation + card.anim_rotation_offset;
+                            // 阵列状态下无随机旋转，一览状态下才有 layout_rot + random_rotation + 落定动画
+                            let rot = if self.grid_view {
+                                0.0
+                            } else {
+                                rot + card.random_rotation + card.anim_rotation_offset
+                            };
                             let scale_eff = if Some(i) == picked_up_index { self.held_scale.unwrap_or(scale_eff) } else { scale_eff };
                             (pos, rot, scale_eff)
                         })
@@ -1821,7 +1826,7 @@ impl DeckRefApp {
                     }
 
                     // 更新每张卡的 anim_scale：仅悬停时稍微放大，不移动位置
-                    // 仅对“刚放下”的那张卡做 anim_rotation_offset 向 0 收敛（落定动画）；其余卡片保持一览/阵列设定的随机旋转
+                    // 仅在一览状态下对“刚放下”的那张卡做 anim_rotation_offset 向 0 收敛（落定动画）；阵列下无旋转
                     // 更新每张卡的 anim_position_delta：打散等位移动画向零收敛
                     let dropped_idx = self.recently_dropped_index;
                     for (i, card) in self.cards.iter_mut().enumerate() {
@@ -1940,7 +1945,12 @@ impl DeckRefApp {
                         if let Some(held_pos) = self.held_smooth_pos {
                             let card = &self.cards[idx];
                             let (_, rot) = self.stack_layout.position_and_rotation(idx, n);
-                            let rot = rot + card.random_rotation + card.anim_rotation_offset;
+                            // 阵列状态下拿起时也显示无旋转
+                            let rot = if self.grid_view {
+                                0.0
+                            } else {
+                                rot + card.random_rotation + card.anim_rotation_offset
+                            };
                             let size = if is_board {
                                 crate::image_card::StackLayout::effective_display_size_in_area(
                                     card.intrinsic_size, idx, n, board_ref_size,
@@ -2132,8 +2142,14 @@ impl DeckRefApp {
                                     card.random_offset = new_offset;
                                     card.display_scale = new_scale;
                                 }
-                                card.random_rotation = -new_layout_rot;
-                                card.anim_rotation_offset = normalize_angle_delta(current_total_rot);
+                                // 阵列状态下无旋转、无落定动画；一览状态下保留随机旋转与落定
+                                if self.grid_view {
+                                    card.random_rotation = 0.0;
+                                    card.anim_rotation_offset = 0.0;
+                                } else {
+                                    card.random_rotation = -new_layout_rot;
+                                    card.anim_rotation_offset = normalize_angle_delta(current_total_rot);
+                                }
                             }
                             self.bring_to_front(idx);
                             // 被置顶挤下去的卡片索引前移，基准尺寸变小，需按「旧索引→新索引」换算 display_scale 以保持视觉尺寸不变
@@ -2148,9 +2164,14 @@ impl DeckRefApp {
                                     self.cards[i].random_offset = old_world_pos[i + 1] - new_lp;
                                 }
                                 self.cards[i].anim_position_delta = egui::Vec2::ZERO;
-                                self.cards[i].anim_rotation_offset = normalize_angle_delta(
-                                    old_total_rots[i + 1] - new_layout_rot - self.cards[i].random_rotation,
-                                );
+                                // 阵列状态下不产生连带旋转，一览状态下才做旋转落定
+                                if self.grid_view {
+                                    self.cards[i].anim_rotation_offset = 0.0;
+                                } else {
+                                    self.cards[i].anim_rotation_offset = normalize_angle_delta(
+                                        old_total_rots[i + 1] - new_layout_rot - self.cards[i].random_rotation,
+                                    );
+                                }
                                 // 该卡由原索引 i+1 移到 i，基准变小，放大 display_scale 以保持视觉尺寸
                                 let card = &mut self.cards[i];
                                 let old_eff = if in_board {

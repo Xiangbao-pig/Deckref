@@ -2,8 +2,8 @@
 
 ## 一、版本与产物
 
-- **版本**：与 `Cargo.toml` 中一致（当前 **0.3.2**）。
-- **产物目录**：`DeckRef-<version>\`（如 `DeckRef-0.3.2`），内含 exe、说明、卸载脚本，以及（若已安装 WiX）MSI 一键安装包。
+- **版本**：与 `Cargo.toml` 中一致（当前 **0.3.3**）。
+- **产物目录**：`DeckRef-<version>\`（如 `DeckRef-0.3.3`），内含 exe、说明、卸载脚本，以及（若已安装 WiX）MSI 一键安装包。
 
 ## 二、环境要求
 
@@ -23,7 +23,7 @@
 
 脚本会：
 
-1. 从 `Cargo.toml` 读取版本号（优先 `cargo pkgid`，失败时默认 0.3.2）；
+1. 从 `Cargo.toml` 读取版本号（优先 `cargo pkgid`，失败时默认 0.3.3）；
 2. 执行 `cargo build --release` 编译 Windows 版 release；
 3. 创建 **`DeckRef-<version>`** 文件夹（若已存在会先清空）；
 4. 将 `deckref.exe`、**DeckRef.ico**（构建时生成于 `wix/`）、**README.txt**、**config_readme.txt**、**Uninstall.bat** 复制到该文件夹；
@@ -34,8 +34,8 @@
 
 ## 四、使用与分发
 
-- **绿色版**：进入 `DeckRef-<version>`（如 `DeckRef-0.3.2`），双击 **deckref.exe** 即可运行。
-- **MSI 安装**：双击 **DeckRef-<version>.msi**（如 `DeckRef-0.3.2.msi`）按提示安装；卸载到「设置 - 应用」中卸载 DeckRef，或运行安装目录下的 **Uninstall.bat** 清理配置/缓存（选「否」则下次安装可继续使用）。
+- **绿色版**：进入 `DeckRef-<version>`（如 `DeckRef-0.3.3`），双击 **deckref.exe** 即可运行。
+- **MSI 安装**：双击 **DeckRef-<version>.msi**（如 `DeckRef-0.3.3.msi`）按提示安装；卸载到「设置 - 应用」中卸载 DeckRef，或运行安装目录下的 **Uninstall.bat** 清理配置/缓存（选「否」则下次安装可继续使用）。
 - **发给他人**：将整个 **DeckRef-<version>** 文件夹打包（zip/拷贝），对方解压后可直接运行 exe 或使用 MSI 安装。
 - **配置与数据**：首次运行会在 `%APPDATA%\DeckRef\` 下创建配置；用户通过 DeckRef 保存的图片在 `用户\图片\Ref` 等目录，卸载不会删除。
 
