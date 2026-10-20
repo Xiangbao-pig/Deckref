@@ -1,6 +1,6 @@
 //! UI 逻辑：堆叠照片、纹理缓存、悬停/长按/排序。
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::image_card::{
     draw_card, draw_card_shadow, lerp_position, lerp_rotation, lerp_scale, normalize_angle_delta,
     rotated_rect_contains, CardSortOrder, ImageCard, StackLayout, DISPLAY_SCALE_MAX,
@@ -18,7 +18,8 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf, Component};
 use std::ffi::OsString;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
@@ -148,6 +149,19 @@ fn screen_aabb_for_rotated_rect(
     let max_y = screen.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
     AABB::from_corners([min_x as f64, min_y as f64], [max_x as f64, max_y as f64])
 }
+
+/// 指针命中查询在屏幕空间 AABB 上向外扩的像素，避免旋转矩形边缘因取整落到包络外。
+const HIT_TEST_QUERY_PADDING: f64 = 4.0;
+
+fn hash_f32(hasher: &mut impl std::hash::Hasher, value: f32) {
+    value.to_bits().hash(hasher);
+}
+
+/// 候选里下标最大且通过精确包含测试的卡片（堆叠前端在前）。
+fn frontmost_hit(candidates: &mut [usize], mut contains: impl FnMut(usize) -> bool) -> Option<usize> {
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    candidates.iter().copied().find(|i| contains(*i))
+}
 fn run_loader_thread(
     mode: AppMode,
     watch_path: PathBuf,
@@ -231,12 +245,91 @@ fn run_loader_thread(
 fn run_texture_loader_thread(
     req_rx: mpsc::Receiver<PathBuf>,
     res_tx: mpsc::Sender<(PathBuf, Vec<u8>, u32, u32)>,
+    repaint: Arc<Mutex<Option<egui::Context>>>,
 ) {
     for path in req_rx {
         if let Ok((rgba, w, h)) = image_ops::load_image_rgba_for_texture(&path) {
-            let _ = res_tx.send((path, rgba, w, h));
+            if res_tx.send((path, rgba, w, h)).is_err() {
+                break;
+            }
+            wake_ui(&repaint);
         }
     }
+}
+
+/// 监听事件附带的尺寸与 metadata。主线程只用它构造卡片，不再自己读盘。
+struct WatchIoDone {
+    generation: u64,
+    path: PathBuf,
+    dimensions: Option<(u32, u32)>,
+    file_size: u64,
+    modified: SystemTime,
+}
+
+fn wake_ui(repaint: &Arc<Mutex<Option<egui::Context>>>) {
+    if let Ok(guard) = repaint.lock() {
+        if let Some(ctx) = guard.as_ref() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn run_watch_io_thread(
+    req_rx: mpsc::Receiver<(u64, PathBuf)>,
+    res_tx: mpsc::Sender<WatchIoDone>,
+    generation: Arc<AtomicU64>,
+    repaint: Arc<Mutex<Option<egui::Context>>>,
+) {
+    while let Ok((requested_generation, path)) = req_rx.recv() {
+        if requested_generation != generation.load(Ordering::Relaxed) {
+            continue;
+        }
+        let dimensions = image_ops::image_dimensions(&path).ok();
+        if requested_generation != generation.load(Ordering::Relaxed) {
+            continue;
+        }
+        let (file_size, modified) = std::fs::metadata(&path)
+            .map(|meta| (meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+            .unwrap_or((0, SystemTime::UNIX_EPOCH));
+        let done = WatchIoDone {
+            generation: requested_generation,
+            path,
+            dimensions,
+            file_size,
+            modified,
+        };
+        if res_tx.send(done).is_err() {
+            break;
+        }
+        wake_ui(&repaint);
+    }
+}
+
+fn spawn_watcher(
+    watch_path: PathBuf,
+    extended_formats: bool,
+    repaint: Arc<Mutex<Option<egui::Context>>>,
+) -> AppResult<(mpsc::Receiver<WatchEvent>, thread::JoinHandle<AppResult<()>>)> {
+    let (tx, rx) = mpsc::channel();
+    let config = WatcherConfig {
+        watch_path,
+        extended_formats,
+        ..WatcherConfig::default()
+    };
+    let handle = crate::watcher::run_watcher(config, tx)?;
+    let (forward_tx, forward_rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("deckref-watch-forward".into())
+        .spawn(move || {
+            while let Ok(event) = rx.recv() {
+                if forward_tx.send(event).is_err() {
+                    break;
+                }
+                wake_ui(&repaint);
+            }
+        })
+        .map_err(|err| AppError::Other(err.to_string()))?;
+    Ok((forward_rx, handle))
 }
 
 /// 拿起状态：卡片索引 + 抓取时指针相对卡片中心的世界坐标偏移（用于跟手）
@@ -344,6 +437,23 @@ pub struct DeckRefApp {
     _texture_loading_handle: Option<thread::JoinHandle<()>>,
     /// 已请求但尚未收到结果的 path，避免重复请求；切换文件夹/清空时清空
     pending_texture_paths: HashSet<PathBuf>,
+    /// 后台线程用来在异步结果到达时唤醒 UI。
+    repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
+    /// 监听事件的 dimensions/metadata 请求。generation 用于丢弃切换文件夹前的旧任务。
+    watch_io_tx: Option<mpsc::Sender<(u64, PathBuf)>>,
+    watch_io_rx: Option<mpsc::Receiver<WatchIoDone>>,
+    _watch_io_handle: Option<thread::JoinHandle<()>>,
+    watch_generation: Arc<AtomicU64>,
+    /// 已提交、结果尚未回到主线程的监听 IO 数。切换文件夹时清零。
+    watch_io_inflight: usize,
+    /// 上一帧屏幕 AABB 的 R-Tree；布局未变时复用，避免每帧 bulk_load。
+    screen_rtree: Option<RTree<CardScreenRect>>,
+    /// 与 `screen_rtree` 对应的布局指纹。
+    screen_rtree_key: Option<u64>,
+    /// 上一帧命中检测使用的屏幕指针；未移动且布局未变时可跳过精确测试。
+    last_hover_screen: Option<egui::Pos2>,
+    last_hovered_index: Option<usize>,
+    last_hover_key: Option<u64>,
 }
 
 impl DeckRefApp {
@@ -359,18 +469,37 @@ impl DeckRefApp {
             .filter(|p| p.is_dir())
             .unwrap_or(default_watch);
         let loaded = settings::load_settings();
-        let (tx, rx) = mpsc::channel();
-        let config = WatcherConfig {
-            watch_path: watch_path.clone(),
-            extended_formats: loaded.preview_professional_formats,
-            ..WatcherConfig::default()
+        let repaint_ctx = Arc::new(Mutex::new(None));
+        let watch_generation = Arc::new(AtomicU64::new(0));
+        let (rx, handle) = spawn_watcher(
+            watch_path.clone(),
+            loaded.preview_professional_formats,
+            repaint_ctx.clone(),
+        )?;
+        let (watch_io_tx_thread, watch_io_rx_thread) = mpsc::channel();
+        let (watch_io_res_tx, watch_io_res_rx) = mpsc::channel();
+        let watch_io_generation = watch_generation.clone();
+        let watch_io_repaint = repaint_ctx.clone();
+        let watch_io_handle = thread::Builder::new()
+            .name("deckref-watch-io".into())
+            .spawn(move || {
+                run_watch_io_thread(
+                    watch_io_rx_thread,
+                    watch_io_res_tx,
+                    watch_io_generation,
+                    watch_io_repaint,
+                );
+            });
+        let (watch_io_tx, watch_io_rx, _watch_io_handle) = match watch_io_handle {
+            Ok(handle) => (Some(watch_io_tx_thread), Some(watch_io_res_rx), Some(handle)),
+            Err(_) => (None, None, None),
         };
-        let handle = crate::watcher::run_watcher(config, tx)?;
         let (tex_req_tx, tex_req_rx) = mpsc::channel();
         let (tex_res_tx, tex_res_rx) = mpsc::channel();
+        let tex_repaint = repaint_ctx.clone();
         let tex_handle = thread::Builder::new()
             .name("deckref-tex-loader".into())
-            .spawn(move || run_texture_loader_thread(tex_req_rx, tex_res_tx));
+            .spawn(move || run_texture_loader_thread(tex_req_rx, tex_res_tx, tex_repaint));
         let (texture_loading_tx, texture_loading_rx, _texture_loading_handle) = match tex_handle {
             Ok(h) => (Some(tex_req_tx), Some(tex_res_rx), Some(h)),
             Err(_) => (None, None, None),
@@ -444,6 +573,17 @@ impl DeckRefApp {
             texture_loading_rx,
             _texture_loading_handle,
             pending_texture_paths: HashSet::new(),
+            repaint_ctx,
+            watch_io_tx,
+            watch_io_rx,
+            _watch_io_handle,
+            watch_generation,
+            watch_io_inflight: 0,
+            screen_rtree: None,
+            screen_rtree_key: None,
+            last_hover_screen: None,
+            last_hovered_index: None,
+            last_hover_key: None,
         };
         app.start_async_load();
         Ok(app)
@@ -463,16 +603,7 @@ impl DeckRefApp {
 
         let _ = new_mode.ensure_dir(&self.base_path);
         let watch_path = new_mode.watch_path(&self.base_path);
-        let (tx, rx) = mpsc::channel();
-        let config = WatcherConfig {
-            watch_path: watch_path.clone(),
-            extended_formats: self.preview_professional_formats,
-            ..WatcherConfig::default()
-        };
-        if let Ok(handle) = crate::watcher::run_watcher(config, tx) {
-            self._watcher_handle = Some(handle);
-            self.watch_rx = rx;
-        }
+        self.restart_watcher(&watch_path);
         self.watch_path = watch_path.display().to_string();
         self.mode = new_mode;
         if new_mode == AppMode::Default {
@@ -600,16 +731,7 @@ impl DeckRefApp {
             self.recent_folder_cards.insert(old_path, self.cards.clone());
         }
 
-        let (tx, rx) = mpsc::channel();
-        let config = WatcherConfig {
-            watch_path: watch_path.clone(),
-            extended_formats: self.preview_professional_formats,
-            ..WatcherConfig::default()
-        };
-        if let Ok(handle) = crate::watcher::run_watcher(config, tx) {
-            self._watcher_handle = Some(handle);
-            self.watch_rx = rx;
-        }
+        self.restart_watcher(&watch_path);
         self.watch_path = watch_path.display().to_string();
         self.long_press = None;
         self.picked_up = None;
@@ -745,30 +867,112 @@ impl DeckRefApp {
         }
     }
 
+    fn restart_watcher(&mut self, watch_path: &Path) {
+        match spawn_watcher(
+            watch_path.to_path_buf(),
+            self.preview_professional_formats,
+            self.repaint_ctx.clone(),
+        ) {
+            Ok((rx, handle)) => {
+                self._watcher_handle = Some(handle);
+                self.watch_rx = rx;
+                self.watch_generation.fetch_add(1, Ordering::Relaxed);
+                self.watch_io_inflight = 0;
+            }
+            Err(err) => {
+                eprintln!("[DeckRef] watcher restart failed: {err}");
+            }
+        }
+    }
+
     fn poll_watch_events(&mut self) {
         while let Ok(ev) = self.watch_rx.try_recv() {
             let path = match ev {
                 WatchEvent::Create(p) | WatchEvent::Modify(p) | WatchEvent::Remove(p) => p,
             };
-            let display_size = image_ops::image_dimensions(&path)
-                .map(|(w, h)| Vec2::new(w as f32, h as f32))
-                .unwrap_or(Vec2::new(220.0, 220.0));
-            let mut card = ImageCard::from_path(path.clone(), display_size);
-            // 若为本次拖入保存的新图，播放落下动画：从上方落下并缩放收敛
-            if self.recent_drop_paths.remove(&path) {
-                card.anim_position_delta = Vec2::new(0.0, DROP_ANIM_INITIAL_OFFSET_Y);
-                card.anim_scale = DROP_ANIM_INITIAL_SCALE;
+            let generation = self.watch_generation.load(Ordering::Relaxed);
+            if let Some(tx) = &self.watch_io_tx {
+                if tx.send((generation, path.clone())).is_ok() {
+                    self.watch_io_inflight = self.watch_io_inflight.saturating_add(1);
+                    continue;
+                }
             }
-            self.cards.push(card);
-            let max = if self.mode == AppMode::Inspiration {
-                INSPIRATION_RECENT_MAX
-            } else {
-                MAX_CARDS
-            };
-            if self.cards.len() > max {
-                let removed = self.cards.remove(0);
-                self.texture_cache.remove(&removed.path);
+            self.push_watched_card_blocking(path);
+        }
+        self.poll_watch_io_results();
+    }
+
+    fn poll_watch_io_results(&mut self) {
+        let current = self.watch_generation.load(Ordering::Relaxed);
+        let mut ready = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = self.watch_io_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(done) => ready.push(done),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
             }
+        }
+        for done in ready {
+            if done.generation != current {
+                continue;
+            }
+            self.watch_io_inflight = self.watch_io_inflight.saturating_sub(1);
+            self.push_watched_card(done);
+        }
+        if disconnected {
+            self.watch_io_rx = None;
+            self.watch_io_tx = None;
+            self.watch_io_inflight = 0;
+        }
+    }
+
+    fn push_watched_card(&mut self, done: WatchIoDone) {
+        let display_size = done
+            .dimensions
+            .map(|(w, h)| Vec2::new(w as f32, h as f32))
+            .unwrap_or(Vec2::new(220.0, 220.0));
+        let mut card = ImageCard::from_path_with_metadata(
+            done.path.clone(),
+            display_size,
+            done.file_size,
+            done.modified,
+        );
+        if self.recent_drop_paths.remove(&done.path) {
+            card.anim_position_delta = Vec2::new(0.0, DROP_ANIM_INITIAL_OFFSET_Y);
+            card.anim_scale = DROP_ANIM_INITIAL_SCALE;
+        }
+        self.push_card_evicting(card);
+    }
+
+    /// worker 不可用时的回退。正常路径不会走到这里。
+    fn push_watched_card_blocking(&mut self, path: PathBuf) {
+        let display_size = image_ops::image_dimensions(&path)
+            .map(|(w, h)| Vec2::new(w as f32, h as f32))
+            .unwrap_or(Vec2::new(220.0, 220.0));
+        let mut card = ImageCard::from_path(path.clone(), display_size);
+        if self.recent_drop_paths.remove(&path) {
+            card.anim_position_delta = Vec2::new(0.0, DROP_ANIM_INITIAL_OFFSET_Y);
+            card.anim_scale = DROP_ANIM_INITIAL_SCALE;
+        }
+        self.push_card_evicting(card);
+    }
+
+    fn push_card_evicting(&mut self, card: ImageCard) {
+        self.cards.push(card);
+        let max = if self.mode == AppMode::Inspiration {
+            INSPIRATION_RECENT_MAX
+        } else {
+            MAX_CARDS
+        };
+        if self.cards.len() > max {
+            let removed = self.cards.remove(0);
+            self.texture_cache.remove(&removed.path);
         }
     }
 
@@ -961,6 +1165,136 @@ impl DeckRefApp {
         }
     }
 
+    /// 屏幕 AABB 指纹。未变化时复用 R-Tree（平移/缩放会改变屏幕坐标，因此会变脏）。
+    fn screen_aabb_key(
+        &self,
+        screen_center: egui::Pos2,
+        view_offset: egui::Vec2,
+        view_scale: f32,
+        n: usize,
+        picked_up_index: Option<usize>,
+    ) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+        n.hash(&mut hasher);
+        hash_f32(&mut hasher, screen_center.x);
+        hash_f32(&mut hasher, screen_center.y);
+        hash_f32(&mut hasher, view_offset.x);
+        hash_f32(&mut hasher, view_offset.y);
+        hash_f32(&mut hasher, view_scale);
+        hash_f32(&mut hasher, self.stack_layout.offset_per_index.x);
+        hash_f32(&mut hasher, self.stack_layout.offset_per_index.y);
+        hash_f32(&mut hasher, self.stack_layout.rotation_per_index);
+        hash_f32(&mut hasher, self.stack_layout.base_rotation);
+        hash_f32(&mut hasher, self.stack_layout.available_size.x);
+        hash_f32(&mut hasher, self.stack_layout.available_size.y);
+        picked_up_index.unwrap_or(usize::MAX).hash(&mut hasher);
+        match self.held_smooth_pos {
+            Some(pos) => {
+                1u8.hash(&mut hasher);
+                hash_f32(&mut hasher, pos.x);
+                hash_f32(&mut hasher, pos.y);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+        match self.held_scale {
+            Some(scale) => {
+                1u8.hash(&mut hasher);
+                hash_f32(&mut hasher, scale);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+        for card in self.cards.iter().take(n) {
+            hash_f32(&mut hasher, card.intrinsic_size.x);
+            hash_f32(&mut hasher, card.intrinsic_size.y);
+            hash_f32(&mut hasher, card.display_scale);
+            hash_f32(&mut hasher, card.random_offset.x);
+            hash_f32(&mut hasher, card.random_offset.y);
+            hash_f32(&mut hasher, card.random_rotation);
+            hash_f32(&mut hasher, card.anim_position_delta.x);
+            hash_f32(&mut hasher, card.anim_position_delta.y);
+            hash_f32(&mut hasher, card.anim_rotation_offset);
+        }
+        hasher.finish()
+    }
+
+    fn ensure_screen_rtree(
+        &mut self,
+        screen_center: egui::Pos2,
+        view_offset: egui::Vec2,
+        view_scale: f32,
+        n: usize,
+        picked_up_index: Option<usize>,
+    ) {
+        let key = self.screen_aabb_key(screen_center, view_offset, view_scale, n, picked_up_index);
+        if self.screen_rtree_key == Some(key) && self.screen_rtree.is_some() {
+            return;
+        }
+        let world_to_screen = |w: egui::Pos2| {
+            let v = w.to_vec2() - view_offset;
+            egui::Pos2::new(
+                screen_center.x + v.x * view_scale,
+                screen_center.y + v.y * view_scale,
+            )
+        };
+        let mut rects: Vec<CardScreenRect> = Vec::with_capacity(n);
+        for (i, card) in self.cards.iter().take(n).enumerate() {
+            let (world_pos, rot) = self.stack_layout.position_and_rotation(i, n);
+            let world_center = if Some(i) == picked_up_index {
+                self.held_smooth_pos
+                    .map(|v| egui::Pos2::new(v.x, v.y))
+                    .unwrap_or(world_pos + card.random_offset + card.anim_position_delta)
+            } else {
+                world_pos + card.random_offset + card.anim_position_delta
+            };
+            let rot = rot + card.random_rotation + card.anim_rotation_offset;
+            let size = self.stack_layout.effective_display_size(card.intrinsic_size, i, n);
+            let scale = if Some(i) == picked_up_index {
+                self.held_scale.unwrap_or(1.0)
+            } else {
+                card.display_scale
+            };
+            let size = size * scale * view_scale;
+            let half = size / 2.0;
+            let aabb = screen_aabb_for_rotated_rect(world_center, half, rot, &world_to_screen);
+            rects.push(CardScreenRect { index: i, aabb });
+        }
+        self.screen_rtree = Some(RTree::bulk_load(rects));
+        self.screen_rtree_key = Some(key);
+    }
+
+    fn hit_test_pointer(
+        &self,
+        pointer_screen: egui::Pos2,
+        picked_up_index: Option<usize>,
+        n: usize,
+        screen_to_world: &impl Fn(egui::Pos2) -> egui::Pos2,
+    ) -> Option<usize> {
+        let tree = self.screen_rtree.as_ref()?;
+        let pad = HIT_TEST_QUERY_PADDING;
+        let envelope = AABB::from_corners(
+            [pointer_screen.x as f64 - pad, pointer_screen.y as f64 - pad],
+            [pointer_screen.x as f64 + pad, pointer_screen.y as f64 + pad],
+        );
+        let mut candidates: Vec<usize> = tree
+            .locate_in_envelope(&envelope)
+            .map(|rect| rect.index)
+            .filter(|index| Some(*index) != picked_up_index && *index < n)
+            .collect();
+        let world_pointer = screen_to_world(pointer_screen);
+        frontmost_hit(&mut candidates, |index| {
+            let Some(card) = self.cards.get(index) else {
+                return false;
+            };
+            let (world_pos, rot) = self.stack_layout.position_and_rotation(index, n);
+            let world_pos = world_pos + card.random_offset + card.anim_position_delta;
+            let rot = rot + card.random_rotation + card.anim_rotation_offset;
+            let size = self.stack_layout.effective_display_size(card.intrinsic_size, index, n);
+            let half = size * card.display_scale / 2.0;
+            rotated_rect_contains(world_pos, half, rot, world_pointer)
+        })
+    }
+
     /// 确保纹理已加载；若失败则返回 None，不 panic。
     /// 优先走后台解码线程（请求入队、本帧返回 None），主线程仅在 poll_texture_results 中做 GPU 上传。
     /// 无后台线程时的回退路径仅在 spawn 失败时触发；回退中仍用缩略图（>2048px 用 load_image_thumbnail），主线程绝不完整解码超大图。
@@ -976,9 +1310,13 @@ impl DeckRefApp {
             self.pending_texture_paths.insert(path.clone());
             return None;
         }
-        // 回退：无后台线程时同步解码（避免 spawn 失败后无法显示图）
+        // 回退：无后台线程时同步解码（避免 spawn 失败后无法显示图）。
+        // 最长边 > 2048 时，仅 JPEG/WebP 走解码期缩小；其余格式不在主线程完整解码。
         let img = match image_ops::image_dimensions(path) {
             Ok((w, h)) if w.max(h) > image_ops::THUMBNAIL_RESOLUTION_THRESHOLD => {
+                if !image_ops::subsamples_when_downscaling(path) {
+                    return None;
+                }
                 image_ops::load_image_thumbnail(path, image_ops::THUMBNAIL_MAX_LONGEST_EDGE).ok()
             }
             _ => image_ops::load_image(path).ok(),
@@ -1231,6 +1569,9 @@ impl DeckRefApp {
 
     fn run_ui(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        if let Ok(mut slot) = self.repaint_ctx.lock() {
+            *slot = Some(ctx.clone());
+        }
 
         // Windows：首帧再注册 OLE 拖放目标，避免被 winit 覆盖导致 Chrome 拖入显示禁止
         #[cfg(windows)]
@@ -1460,27 +1801,38 @@ impl DeckRefApp {
                         }
                     }
 
-                    // 命中检测（从最前到最后），使用世界坐标；拿起中的卡片不参与悬停
+                    // 命中检测：R-Tree 查出指针附近的卡，再按堆叠顺序做旋转矩形测试（前端优先）。
+                    // 指针未移动且屏幕 AABB 未变时复用上一帧结果。拿起中的卡片不参与悬停。
                     let picked_up_index = self.picked_up.as_ref().map(|(i, _, _)| *i);
+                    self.ensure_screen_rtree(screen_center, view_offset, view_scale, n, picked_up_index);
+                    let world_pointer = pointer.map(&screen_to_world);
                     let mut hovered_index = None;
-                    let world_pointer = pointer.map(screen_to_world);
-                    for i in (0..n).rev() {
-                        if Some(i) == picked_up_index {
-                            continue;
+                    if let Some(pointer_screen) = pointer {
+                        let layout_key = self.screen_rtree_key;
+                        let pointer_still = self.last_hover_screen == Some(pointer_screen);
+                        let no_gesture = self.picked_up.is_none()
+                            && self.long_press.is_none()
+                            && self.drag_pending.is_none();
+                        if pointer_still && no_gesture && layout_key.is_some() && self.last_hover_key == layout_key
+                        {
+                            hovered_index = self
+                                .last_hovered_index
+                                .filter(|index| *index < n && Some(*index) != picked_up_index);
+                        } else {
+                            hovered_index = self.hit_test_pointer(
+                                pointer_screen,
+                                picked_up_index,
+                                n,
+                                &screen_to_world,
+                            );
+                            self.last_hover_screen = Some(pointer_screen);
+                            self.last_hovered_index = hovered_index;
+                            self.last_hover_key = layout_key;
                         }
-                        let card = &self.cards[i];
-                        let (world_pos, rot) = self.stack_layout.position_and_rotation(i, n);
-                        let world_pos = world_pos + card.random_offset + card.anim_position_delta;
-                        let rot = rot + card.random_rotation + card.anim_rotation_offset;
-                        let size = self.stack_layout.effective_display_size(card.intrinsic_size, i, n);
-                        let size = size * card.display_scale;
-                        let half = size / 2.0;
-                        if let Some(wp) = world_pointer {
-                            if rotated_rect_contains(world_pos, half, rot, wp) {
-                                hovered_index = Some(i);
-                                break;
-                            }
-                        }
+                    } else {
+                        self.last_hover_screen = None;
+                        self.last_hovered_index = None;
+                        self.last_hover_key = None;
                     }
 
                     // 更新每张卡的 anim_scale：仅悬停时稍微放大，不移动位置
@@ -1511,31 +1863,13 @@ impl DeckRefApp {
                         [viewport_for_culling.min.x as f64, viewport_for_culling.min.y as f64],
                         [viewport_for_culling.max.x as f64, viewport_for_culling.max.y as f64],
                     );
-                    let mut rects: Vec<CardScreenRect> = Vec::with_capacity(n);
-                    for (i, card) in self.cards.iter().enumerate() {
-                        let (world_pos, rot) = self.stack_layout.position_and_rotation(i, n);
-                        let world_center = if Some(i) == picked_up_index {
-                            self.held_smooth_pos
-                                .map(|v| egui::Pos2::new(v.x, v.y))
-                                .unwrap_or(world_pos + card.random_offset + card.anim_position_delta)
-                        } else {
-                            world_pos + card.random_offset + card.anim_position_delta
-                        };
-                        let rot = rot + card.random_rotation + card.anim_rotation_offset;
-                        let size = self.stack_layout.effective_display_size(card.intrinsic_size, i, n);
-                        let scale = if Some(i) == picked_up_index {
-                            self.held_scale.unwrap_or(1.0)
-                        } else {
-                            card.display_scale
-                        };
-                        let size = size * scale * view_scale;
-                        let half = size / 2.0;
-                        let aabb = screen_aabb_for_rotated_rect(world_center, half, rot, &world_to_screen);
-                        rects.push(CardScreenRect { index: i, aabb });
-                    }
-                    let tree = RTree::bulk_load(rects);
-                    let visible_indices: HashSet<usize> = tree
-                        .locate_in_envelope(&viewport_aabb)
+                    // 动画更新后屏幕 AABB 可能变化；未变化则复用命中检测前建好的树。拿起卡仍在树中，并在后面单独绘制。
+                    self.ensure_screen_rtree(screen_center, view_offset, view_scale, n, picked_up_index);
+                    let visible_indices: HashSet<usize> = self
+                        .screen_rtree
+                        .as_ref()
+                        .map(|tree| {
+                            tree.locate_in_envelope(&viewport_aabb)
                         .filter_map(|r| {
                             let card_area = r.aabb.area();
                             if card_area <= 0.0 {
@@ -1548,7 +1882,9 @@ impl DeckRefApp {
                                 None
                             }
                         })
-                        .collect();
+                        .collect()
+                        })
+                        .unwrap_or_default();
 
                     // 仅对可见卡（及拿起卡）请求纹理，堆叠前端优先
                     let paths_to_load: Vec<PathBuf> = self
@@ -2162,19 +2498,36 @@ impl DeckRefApp {
             self.held_scale = None;
         }
 
-        // 仅在需要连续重绘时请求 repaint，避免每帧强制重绘导致透明窗口抖动。
-        // 包含缩放/平移：一览与阵列都会重置 view，之后用户仍可滚轮缩放、中键平移，必须持续重绘才能生效。
-        let needs_continuous_repaint = self.picked_up.is_some()
-            || (self.view_scale - 1.0).abs() > 1e-6
-            || self.view_offset.length_sq() > 1e-6
-            || self.cards.iter().any(|c| {
-                c.anim_position_delta.length_sq() > 1e-8
-                    || c.anim_rotation_offset.abs() > 1e-6
-                    || (c.anim_scale - 1.0).abs() > 1e-4
-            });
-        if needs_continuous_repaint {
+        // 静止且没有未完成工作时不主动重绘，交给 egui 的输入事件。
+        // 平移/缩放写在收到滚轮或中键拖动的那一帧里，松手后保持当前 view，不必空转。
+        let now = ctx.input(|i| i.time);
+        let interacting = self.picked_up.is_some()
+            || self.long_press.is_some()
+            || self.right_drag_started
+            || self.drag_pending.is_some()
+            || ctx.input(|i| i.pointer.middle_down());
+        let loading = self.loading_rx.is_some()
+            || self.watch_io_inflight > 0
+            || !self.pending_texture_paths.is_empty();
+        if interacting || loading || self.card_motion_pending() {
             ctx.request_repaint();
+        } else if now < self.shift_listening_until {
+            let since_check = now - self.last_clipboard_check_time;
+            let wait = (CLIPBOARD_POLL_INTERVAL - since_check).max(0.05);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
+    }
+
+    /// 落下/打散/悬停缩放尚未收敛时需要继续重绘。悬停停在 1.08 视为已收敛。
+    fn card_motion_pending(&self) -> bool {
+        let hovered = self.last_hovered_index;
+        let dropped = self.recently_dropped_index;
+        self.cards.iter().enumerate().any(|(index, card)| {
+            let target_scale = if hovered == Some(index) { 1.08 } else { 1.0 };
+            (card.anim_scale - target_scale).abs() > 1e-3
+                || card.anim_position_delta.length_sq() > 1e-4
+                || (dropped == Some(index) && card.anim_rotation_offset.abs() > 5e-4)
+        })
     }
 }
 
@@ -2197,5 +2550,23 @@ impl eframe::App for DeckRefApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.run_ui(ctx, frame);
+    }
+}
+
+#[cfg(test)]
+mod hit_test_tests {
+    use super::frontmost_hit;
+
+    #[test]
+    fn frontmost_hit_picks_highest_index_that_contains() {
+        let mut candidates = vec![0usize, 2, 5, 3];
+        let hit = frontmost_hit(&mut candidates, |index| index == 0 || index == 3);
+        assert_eq!(hit, Some(3));
+    }
+
+    #[test]
+    fn frontmost_hit_none_when_nothing_contains_the_point() {
+        let mut candidates = vec![1usize, 4];
+        assert_eq!(frontmost_hit(&mut candidates, |_| false), None);
     }
 }

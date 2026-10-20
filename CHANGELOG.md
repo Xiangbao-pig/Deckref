@@ -8,6 +8,10 @@
 
 ## 未发布
 
+- **2026-10-20** 大图缩略图：JPEG 在解码时按 IDCT 缩小、WebP 用 libwebp 按目标边长缩放，最长边超过 2048 时不再先得到整幅像素缓冲；PNG 等格式仍解码后再缩放。主线程回退只对 JPEG/WebP 做这档缩略图，其余超大图不在主线程完整解码。阈值仍是 2048 / 1200。涉及：`src/image_ops.rs`、`src/app.rs`。
+- **2026-10-20** R-Tree：屏幕 AABB 没变时不再每帧 `bulk_load`。命中检测先查指针附近的包络，再做 `rotated_rect_contains`，仍然前端优先。拿起中的卡仍在树里，并照旧单独画在最上层。涉及：`src/app.rs`。
+- **2026-10-20** 监听：Create/Modify/Remove 只把路径交给后台线程读尺寸和 metadata，主线程收到结果后用 `from_path_with_metadata` 建卡。防抖仍是 400ms，超过 `MAX_CARDS` 仍删第一张，拖入落下动画保留；切换文件夹会丢掉过期任务。涉及：`src/app.rs`。
+- **2026-10-20** 重绘：只在动画还没收敛、目录/纹理/监听 IO 还没结束、拿起或拖动、或 Shift 后的剪贴板监听窗口内请求重绘；后台结果到达时唤醒界面。静止堆叠不再因为视角已经平移或缩放而空转。涉及：`src/app.rs`。
 - **2025-03-03** 底部栏右下角显示版本号（半透明灰色）与左键点住图片时显示该图完整文件名。涉及：`src/app.rs`、`docs/INTERACTIONS.md`。
 - **2025-03-02** 阵列（热力图式）紧密排列：阵列改为按原比例、无缝紧密排列（类似股市热力图）。行内与行间无缝隙，每行等高、按 aspect 贪心分行，整体缩放填满可用区域；内边距改为 4px。涉及：`src/app.rs`（`grid_arrange` 行式无缝排布、row_boundaries、display_scale 按矩形宽高计算）。
 - **2025-03-05** R-Tree 视口查询框扩大：查询时不再只用屏幕框，改为向四周各扩充 500 像素（`VIEWPORT_QUERY_PADDING`）再查 R-Tree，预加载邻域内的卡，减少平移时 pop-in。涉及：`src/app.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
