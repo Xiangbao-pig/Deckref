@@ -292,6 +292,7 @@ fn load_jpeg_thumbnail(path: &Path, width: u32, height: u32, max_longest_edge: u
 }
 
 /// 测试用：JPEG 在最终缩放到目标边长之前，IDCT 解码得到的尺寸。
+#[cfg(test)]
 fn jpeg_idct_output_size(path: &Path, max_longest_edge: u32) -> AppResult<(u32, u32)> {
     let (width, height) = image_dimensions(path)?;
     let idct_scale = choose_jpeg_idct_scale(width, height, max_longest_edge);
