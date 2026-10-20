@@ -976,9 +976,13 @@ impl DeckRefApp {
             self.pending_texture_paths.insert(path.clone());
             return None;
         }
-        // 回退：无后台线程时同步解码（避免 spawn 失败后无法显示图）
+        // 回退：无后台线程时同步解码（避免 spawn 失败后无法显示图）。
+        // 最长边 > 2048 时，仅 JPEG/WebP 走解码期缩小；其余格式不在主线程完整解码。
         let img = match image_ops::image_dimensions(path) {
             Ok((w, h)) if w.max(h) > image_ops::THUMBNAIL_RESOLUTION_THRESHOLD => {
+                if !image_ops::subsamples_when_downscaling(path) {
+                    return None;
+                }
                 image_ops::load_image_thumbnail(path, image_ops::THUMBNAIL_MAX_LONGEST_EDGE).ok()
             }
             _ => image_ops::load_image(path).ok(),
