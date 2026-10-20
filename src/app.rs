@@ -2498,19 +2498,36 @@ impl DeckRefApp {
             self.held_scale = None;
         }
 
-        // 仅在需要连续重绘时请求 repaint，避免每帧强制重绘导致透明窗口抖动。
-        // 包含缩放/平移：一览与阵列都会重置 view，之后用户仍可滚轮缩放、中键平移，必须持续重绘才能生效。
-        let needs_continuous_repaint = self.picked_up.is_some()
-            || (self.view_scale - 1.0).abs() > 1e-6
-            || self.view_offset.length_sq() > 1e-6
-            || self.cards.iter().any(|c| {
-                c.anim_position_delta.length_sq() > 1e-8
-                    || c.anim_rotation_offset.abs() > 1e-6
-                    || (c.anim_scale - 1.0).abs() > 1e-4
-            });
-        if needs_continuous_repaint {
+        // 静止且没有未完成工作时不主动重绘，交给 egui 的输入事件。
+        // 平移/缩放写在收到滚轮或中键拖动的那一帧里，松手后保持当前 view，不必空转。
+        let now = ctx.input(|i| i.time);
+        let interacting = self.picked_up.is_some()
+            || self.long_press.is_some()
+            || self.right_drag_started
+            || self.drag_pending.is_some()
+            || ctx.input(|i| i.pointer.middle_down());
+        let loading = self.loading_rx.is_some()
+            || self.watch_io_inflight > 0
+            || !self.pending_texture_paths.is_empty();
+        if interacting || loading || self.card_motion_pending() {
             ctx.request_repaint();
+        } else if now < self.shift_listening_until {
+            let since_check = now - self.last_clipboard_check_time;
+            let wait = (CLIPBOARD_POLL_INTERVAL - since_check).max(0.05);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
+    }
+
+    /// 落下/打散/悬停缩放尚未收敛时需要继续重绘。悬停停在 1.08 视为已收敛。
+    fn card_motion_pending(&self) -> bool {
+        let hovered = self.last_hovered_index;
+        let dropped = self.recently_dropped_index;
+        self.cards.iter().enumerate().any(|(index, card)| {
+            let target_scale = if hovered == Some(index) { 1.08 } else { 1.0 };
+            (card.anim_scale - target_scale).abs() > 1e-3
+                || card.anim_position_delta.length_sq() > 1e-4
+                || (dropped == Some(index) && card.anim_rotation_offset.abs() > 5e-4)
+        })
     }
 }
 
