@@ -8,6 +8,8 @@
 
 ## 未发布
 
+- **2026-10-22** 性能（移植到 0.3.3，交互不变）：大图 JPEG/WebP 在解码期按目标边长缩小；屏幕 AABB 未变时复用 R-Tree，命中先查指针附近再做旋转矩形测试；监听事件的尺寸与 metadata 改到 `deckref-watch-io`；静止且没有动画/加载时不再每帧 `request_repaint`。涉及：`src/image_ops.rs`、`src/app/mod.rs`、`src/app/stack_cull_draw.rs`、`src/app_threads.rs`、`Cargo.toml`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+
 - **2026-05-07** 重构（阶段 3）：中央堆叠区从 `app/mod.rs` 拆出为 `stack_viewport`（resize/平移、滚轮缩放、`ViewTransform`）、`stack_cull_draw`（几何、剔除、纹理请求、绘制与框选视觉）、`stack_interaction`（框选端点、长按拿起、跟手、松手与选中）；`ui_stack_canvas.rs` 编排 `CentralPanel` 内调用顺序，与拆分前一致（含「滚轮写入 app 前快照视口」）。涉及：`src/app/mod.rs`、`src/app/ui_stack_canvas.rs`、`src/app/stack_*.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
 
 - **2026-05-07** 修复（Windows）：地址栏面包屑在盘符段使用 `F:` 而非 `F:\`，点击「F:」会进入该盘**当前工作目录**（若进程曾在 `F:\deckref` 下操作则表现为跳进 deckref），无法稳定回到盘根。现于 `path_breadcrumbs` 在 `Prefix` 后合并 `RootDir`，并在 `navigate_watch_path` / 地址栏 Enter 对单独盘符做规范化。涉及：`src/app_nav.rs`、`src/app/mod.rs`、`src/app/ui_top_bar.rs`。

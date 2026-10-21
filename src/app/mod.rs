@@ -9,14 +9,18 @@ use crate::image_card::{
 use crate::image_ops;
 use crate::mode::AppMode;
 use crate::settings;
-use crate::watcher::{list_existing_image_paths, WatchEvent, WatcherConfig};
+use crate::watcher::{list_existing_image_paths, WatchEvent};
 use crate::window_state;
+use crate::app_threads::RepaintHook;
+use crate::app_viewport::CardScreenRect;
 use crate::layout;
 use eframe::egui::{self, ColorImage, TextureHandle, Vec2};
+use rstar::RTree;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
@@ -185,6 +189,23 @@ pub struct DeckRefApp {
     last_stack_screen_center: Option<egui::Vec2>,
     /// 已请求但尚未收到结果的 path，避免重复请求；切换文件夹/清空时清空
     pending_texture_paths: HashSet<PathBuf>,
+    /// 后台线程用来在异步结果到达时唤醒 UI。
+    repaint_ctx: RepaintHook,
+    /// 监听事件的 dimensions/metadata 请求。generation 用于丢弃切换文件夹前的旧任务。
+    watch_io_tx: Option<mpsc::Sender<(u64, PathBuf)>>,
+    watch_io_rx: Option<mpsc::Receiver<crate::app_threads::WatchIoDone>>,
+    _watch_io_handle: Option<thread::JoinHandle<()>>,
+    watch_generation: Arc<AtomicU64>,
+    /// 已提交、结果尚未回到主线程的监听 IO 数。切换文件夹时清零。
+    watch_io_inflight: usize,
+    /// 上一帧屏幕 AABB 的 R-Tree；布局未变时复用，避免每帧 bulk_load。
+    screen_rtree: Option<RTree<CardScreenRect>>,
+    /// 与 `screen_rtree` 对应的布局指纹。
+    screen_rtree_key: Option<u64>,
+    /// 上一帧命中检测使用的屏幕指针；未移动且布局未变时可跳过精确测试。
+    last_hover_screen: Option<egui::Pos2>,
+    last_hovered_index: Option<usize>,
+    last_hover_key: Option<u64>,
 }
 
 impl DeckRefApp {
@@ -200,22 +221,41 @@ impl DeckRefApp {
             .filter(|p| p.is_dir())
             .unwrap_or(default_watch);
         let loaded = settings::load_settings();
-        let (tx, rx) = mpsc::channel();
-        let config = WatcherConfig {
-            watch_path: watch_path.clone(),
-            extended_formats: loaded.preview_professional_formats,
-            ..WatcherConfig::default()
-        };
-        let handle = crate::watcher::run_watcher(config, tx)?;
+        let repaint_ctx: RepaintHook = Arc::new(Mutex::new(None));
+        let watch_generation = Arc::new(AtomicU64::new(0));
+        let (rx, handle) = crate::app_threads::spawn_waking_watcher(
+            watch_path.clone(),
+            loaded.preview_professional_formats,
+            repaint_ctx.clone(),
+        )?;
         let (tex_req_tx, tex_req_rx) = mpsc::channel();
         let (tex_res_tx, tex_res_rx) = mpsc::channel();
+        let tex_repaint = repaint_ctx.clone();
         let tex_handle = thread::Builder::new()
             .name("deckref-tex-loader".into())
             .spawn(move || {
-                crate::app_threads::run_texture_loader_thread(tex_req_rx, tex_res_tx)
+                crate::app_threads::run_texture_loader_thread(tex_req_rx, tex_res_tx, tex_repaint)
             });
         let (texture_loading_tx, texture_loading_rx, _texture_loading_handle) = match tex_handle {
             Ok(h) => (Some(tex_req_tx), Some(tex_res_rx), Some(h)),
+            Err(_) => (None, None, None),
+        };
+        let (watch_io_tx_thread, watch_io_rx_thread) = mpsc::channel();
+        let (watch_io_res_tx, watch_io_res_rx) = mpsc::channel();
+        let watch_io_generation = watch_generation.clone();
+        let watch_io_repaint = repaint_ctx.clone();
+        let watch_io_handle = thread::Builder::new()
+            .name("deckref-watch-io".into())
+            .spawn(move || {
+                crate::app_threads::run_watch_io_thread(
+                    watch_io_rx_thread,
+                    watch_io_res_tx,
+                    watch_io_generation,
+                    watch_io_repaint,
+                )
+            });
+        let (watch_io_tx, watch_io_rx, _watch_io_handle) = match watch_io_handle {
+            Ok(h) => (Some(watch_io_tx_thread), Some(watch_io_res_rx), Some(h)),
             Err(_) => (None, None, None),
         };
         let mut app = Self {
@@ -301,6 +341,17 @@ impl DeckRefApp {
             last_board_screen_center: None,
             last_stack_screen_center: None,
             pending_texture_paths: HashSet::new(),
+            repaint_ctx,
+            watch_io_tx,
+            watch_io_rx,
+            _watch_io_handle,
+            watch_generation,
+            watch_io_inflight: 0,
+            screen_rtree: None,
+            screen_rtree_key: None,
+            last_hover_screen: None,
+            last_hovered_index: None,
+            last_hover_key: None,
         };
         app.start_async_load();
         Ok(app)
@@ -338,16 +389,16 @@ impl DeckRefApp {
         } else {
             new_mode.watch_path(&self.base_path)
         };
-        let (tx, rx) = mpsc::channel();
-        let config = WatcherConfig {
-            watch_path: watch_path.clone(),
-            extended_formats: self.preview_professional_formats,
-            ..WatcherConfig::default()
-        };
-        if let Ok(handle) = crate::watcher::run_watcher(config, tx) {
+        if let Ok((rx, handle)) = crate::app_threads::spawn_waking_watcher(
+            watch_path.clone(),
+            self.preview_professional_formats,
+            self.repaint_ctx.clone(),
+        ) {
             self._watcher_handle = Some(handle);
             self.watch_rx = rx;
         }
+        self.watch_generation.fetch_add(1, Ordering::Relaxed);
+        self.watch_io_inflight = 0;
         self.watch_path = watch_path.display().to_string();
         self.mode = new_mode;
         if new_mode == AppMode::Default || new_mode == AppMode::Board {
@@ -438,6 +489,7 @@ impl DeckRefApp {
         let watch_path = PathBuf::from(&self.watch_path);
         let screenshot_dir = self.screenshot_dir.clone();
         let extended_formats = self.preview_professional_formats;
+        let repaint = self.repaint_ctx.clone();
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::Builder::new()
@@ -451,6 +503,7 @@ impl DeckRefApp {
                     MAX_CARDS,
                     INSPIRATION_RECENT_MAX,
                     tx,
+                    repaint,
                 );
             });
 
@@ -510,16 +563,16 @@ impl DeckRefApp {
             self.recent_folder_cards.insert(old_path, self.cards.clone());
         }
 
-        let (tx, rx) = mpsc::channel();
-        let config = WatcherConfig {
-            watch_path: watch_path.clone(),
-            extended_formats: self.preview_professional_formats,
-            ..WatcherConfig::default()
-        };
-        if let Ok(handle) = crate::watcher::run_watcher(config, tx) {
+        if let Ok((rx, handle)) = crate::app_threads::spawn_waking_watcher(
+            watch_path.clone(),
+            self.preview_professional_formats,
+            self.repaint_ctx.clone(),
+        ) {
             self._watcher_handle = Some(handle);
             self.watch_rx = rx;
         }
+        self.watch_generation.fetch_add(1, Ordering::Relaxed);
+        self.watch_io_inflight = 0;
         self.watch_path = watch_path.display().to_string();
         if (self.mode == AppMode::Default || self.mode == AppMode::Board) && watch_path.is_dir() {
             let _ = window_state::save_last_folder_sync(&watch_path);
@@ -690,25 +743,89 @@ impl DeckRefApp {
             let path = match ev {
                 WatchEvent::Create(p) | WatchEvent::Modify(p) | WatchEvent::Remove(p) => p,
             };
-            let display_size = image_ops::image_dimensions(&path)
-                .map(|(w, h)| Vec2::new(w as f32, h as f32))
-                .unwrap_or(Vec2::new(220.0, 220.0));
-            let mut card = ImageCard::from_path(path.clone(), display_size);
-            // 若为本次拖入保存的新图，播放落下动画：从上方落下并缩放收敛
-            if self.recent_drop_paths.remove(&path) {
-                card.anim_position_delta = Vec2::new(0.0, DROP_ANIM_INITIAL_OFFSET_Y);
-                card.anim_scale = DROP_ANIM_INITIAL_SCALE;
+            let generation = self.watch_generation.load(Ordering::Relaxed);
+            if let Some(tx) = &self.watch_io_tx {
+                if tx.send((generation, path.clone())).is_ok() {
+                    self.watch_io_inflight = self.watch_io_inflight.saturating_add(1);
+                    continue;
+                }
             }
-            self.cards.push(card);
-            let max = if self.mode == AppMode::Inspiration {
-                INSPIRATION_RECENT_MAX
-            } else {
-                MAX_CARDS
-            };
-            if self.cards.len() > max {
-                let removed = self.cards.remove(0);
-                self.texture_cache.remove(&removed.path);
+            self.push_watched_card_blocking(path);
+        }
+        self.poll_watch_io_results();
+    }
+
+    fn poll_watch_io_results(&mut self) {
+        let current = self.watch_generation.load(Ordering::Relaxed);
+        let mut ready = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = self.watch_io_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(done) => ready.push(done),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
             }
+        }
+        for done in ready {
+            if done.generation != current {
+                continue;
+            }
+            self.watch_io_inflight = self.watch_io_inflight.saturating_sub(1);
+            self.push_watched_card(done);
+        }
+        if disconnected {
+            self.watch_io_rx = None;
+            self.watch_io_tx = None;
+            self.watch_io_inflight = 0;
+        }
+    }
+
+    fn push_watched_card(&mut self, done: crate::app_threads::WatchIoDone) {
+        let display_size = done
+            .dimensions
+            .map(|(w, h)| Vec2::new(w as f32, h as f32))
+            .unwrap_or(Vec2::new(220.0, 220.0));
+        let mut card = ImageCard::from_path_with_metadata(
+            done.path.clone(),
+            display_size,
+            done.file_size,
+            done.modified,
+        );
+        if self.recent_drop_paths.remove(&done.path) {
+            card.anim_position_delta = Vec2::new(0.0, DROP_ANIM_INITIAL_OFFSET_Y);
+            card.anim_scale = DROP_ANIM_INITIAL_SCALE;
+        }
+        self.push_card_evicting(card);
+    }
+
+    /// worker 不可用时的回退。正常路径不会走到这里。
+    fn push_watched_card_blocking(&mut self, path: PathBuf) {
+        let display_size = image_ops::image_dimensions(&path)
+            .map(|(w, h)| Vec2::new(w as f32, h as f32))
+            .unwrap_or(Vec2::new(220.0, 220.0));
+        let mut card = ImageCard::from_path(path.clone(), display_size);
+        if self.recent_drop_paths.remove(&path) {
+            card.anim_position_delta = Vec2::new(0.0, DROP_ANIM_INITIAL_OFFSET_Y);
+            card.anim_scale = DROP_ANIM_INITIAL_SCALE;
+        }
+        self.push_card_evicting(card);
+    }
+
+    fn push_card_evicting(&mut self, card: ImageCard) {
+        self.cards.push(card);
+        let max = if self.mode == AppMode::Inspiration {
+            INSPIRATION_RECENT_MAX
+        } else {
+            MAX_CARDS
+        };
+        if self.cards.len() > max {
+            let removed = self.cards.remove(0);
+            self.texture_cache.remove(&removed.path);
         }
     }
 
@@ -916,9 +1033,13 @@ impl DeckRefApp {
             self.pending_texture_paths.insert(path.clone());
             return None;
         }
-        // 回退：无后台线程时同步解码（避免 spawn 失败后无法显示图）
+        // 回退：无后台线程时同步解码（避免 spawn 失败后无法显示图）。
+        // 最长边 > 2048 时，仅 JPEG/WebP 走解码期缩小；其余格式不在主线程完整解码。
         let img = match image_ops::image_dimensions(path) {
             Ok((w, h)) if w.max(h) > image_ops::THUMBNAIL_RESOLUTION_THRESHOLD => {
+                if !image_ops::subsamples_when_downscaling(path) {
+                    return None;
+                }
                 image_ops::load_image_thumbnail(path, image_ops::THUMBNAIL_MAX_LONGEST_EDGE).ok()
             }
             _ => image_ops::load_image(path).ok(),
@@ -1186,6 +1307,9 @@ impl DeckRefApp {
     }
 
     fn run_ui(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Ok(mut guard) = self.repaint_ctx.lock() {
+            *guard = Some(ctx.clone());
+        }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
 
         // Windows：首帧再注册 OLE 拖放目标，避免被 winit 覆盖导致 Chrome 拖入显示禁止
@@ -1451,23 +1575,42 @@ impl DeckRefApp {
             }
         }
 
-        // 仅在需要连续重绘时请求 repaint，避免每帧强制重绘导致透明窗口抖动。
-        // 包含缩放/平移：画板用 board_view_*，默认/灵感用 view_*，一览与阵列会重置对应 view。
-        let view_needs_repaint = if self.mode == AppMode::Board {
-            (self.board_view_scale - 1.0).abs() > 1e-6 || self.board_view_offset.length_sq() > 1e-6
-        } else {
-            (self.view_scale - 1.0).abs() > 1e-6 || self.view_offset.length_sq() > 1e-6
-        };
-        let needs_continuous_repaint = self.picked_up.is_some()
-            || view_needs_repaint
-            || self.cards.iter().any(|c| {
-                c.anim_position_delta.length_sq() > 1e-8
-                    || c.anim_rotation_offset.abs() > 1e-6
-                    || (c.anim_scale - 1.0).abs() > 1e-4
-            });
-        if needs_continuous_repaint {
+        // 静止且没有未完成工作时不主动重绘，交给 egui 的输入事件。
+        // 平移/缩放写在收到滚轮或中键拖动的那一帧里，松手后保持当前 view，不必空转。
+        let now = ctx.input(|i| i.time);
+        let interacting = self.picked_up.is_some()
+            || self.long_press.is_some()
+            || self.right_drag_started
+            || self.drag_pending.is_some()
+            || self.marquee_start_screen.is_some()
+            || ctx.input(|i| i.pointer.middle_down());
+        let loading = self.loading_rx.is_some()
+            || self.watch_io_inflight > 0
+            || !self.pending_texture_paths.is_empty();
+        if interacting || loading || self.card_motion_pending() {
             ctx.request_repaint();
+        } else if now < self.shift_listening_until {
+            let since_check = now - self.last_clipboard_check_time;
+            let wait = (CLIPBOARD_POLL_INTERVAL - since_check).max(0.05);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+        } else if self.mode == AppMode::Board && !self.cards.is_empty() {
+            let elapsed = now - self.last_board_layout_save_time;
+            if self.last_board_layout_save_time > 0.0 && elapsed < 5.0 {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64((5.0 - elapsed).max(0.05)));
+            }
         }
+    }
+
+    /// 落下/打散/悬停缩放尚未收敛时需要继续重绘。悬停停在 1.08 视为已收敛。
+    fn card_motion_pending(&self) -> bool {
+        let hovered = self.last_hovered_index;
+        let dropped = self.recently_dropped_index;
+        self.cards.iter().enumerate().any(|(index, card)| {
+            let target_scale = if hovered == Some(index) { 1.08 } else { 1.0 };
+            (card.anim_scale - target_scale).abs() > 1e-3
+                || card.anim_position_delta.length_sq() > 1e-4
+                || (dropped == Some(index) && card.anim_rotation_offset.abs() > 5e-4)
+        })
     }
 }
 

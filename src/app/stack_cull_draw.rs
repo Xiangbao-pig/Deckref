@@ -10,8 +10,13 @@ use crate::image_card::{
 use crate::mode::AppMode;
 use eframe::egui::{self, Pos2, Rect, Vec2};
 use rstar::{AABB, Envelope, RTree};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+
+/// 指针命中查询在屏幕空间 AABB 上向外扩的像素，避免旋转矩形边缘因取整落到包络外。
+const HIT_TEST_QUERY_PADDING: f64 = 4.0;
 
 pub(super) fn draw_empty_folder_message(ui: &mut egui::Ui, stack_rect: Rect, n: usize) {
     if n != 0 {
@@ -101,45 +106,166 @@ pub(super) fn compute_card_display(app: &DeckRefApp, n: usize) -> Vec<(Vec2, f32
 }
 
 pub(super) fn compute_hovered_index(
-    app: &DeckRefApp,
+    app: &mut DeckRefApp,
     n: usize,
     card_display: &[(Vec2, f32, f32)],
-    world_pointer: Option<Pos2>,
+    pointer_screen: Option<Pos2>,
+    view: &ViewTransform,
     is_board: bool,
     board_ref_size: Vec2,
 ) -> Option<usize> {
+    ensure_screen_rtree(app, n, card_display, view, is_board, board_ref_size);
+    let Some(pointer_screen) = pointer_screen else {
+        app.last_hover_screen = None;
+        app.last_hovered_index = None;
+        app.last_hover_key = None;
+        return None;
+    };
     let picked_up_index = app.picked_up.as_ref().map(|(i, _, _)| *i);
-    for i in (0..n).rev() {
-        if Some(i) == picked_up_index {
-            continue;
-        }
-        let (world_pos, rot, scale_eff) = card_display[i];
-        let card = &app.cards[i];
-        let size = if is_board {
-            crate::image_card::StackLayout::effective_display_size_in_area(
-                card.intrinsic_size,
-                i,
-                n,
-                board_ref_size,
-            )
-        } else {
-            app.stack_layout
-                .effective_display_size(card.intrinsic_size, i, n)
-        };
-        let size = size * scale_eff;
-        let half = size / 2.0;
-        if let Some(wp) = world_pointer {
-            if rotated_rect_contains(
-                Pos2::new(world_pos.x, world_pos.y),
-                half,
-                rot,
-                wp,
-            ) {
-                return Some(i);
-            }
-        }
+    let layout_key = app.screen_rtree_key;
+    let pointer_still = app.last_hover_screen == Some(pointer_screen);
+    let no_gesture = app.picked_up.is_none()
+        && app.long_press.is_none()
+        && app.drag_pending.is_none()
+        && app.marquee_start_screen.is_none();
+    if pointer_still && no_gesture && layout_key.is_some() && app.last_hover_key == layout_key {
+        return app
+            .last_hovered_index
+            .filter(|index| *index < n && Some(*index) != picked_up_index);
     }
-    None
+    let world_pointer = view.screen_to_world(pointer_screen);
+    let hovered_index = hit_test_pointer(
+        app,
+        pointer_screen,
+        picked_up_index,
+        n,
+        card_display,
+        world_pointer,
+        is_board,
+        board_ref_size,
+    );
+    app.last_hover_screen = Some(pointer_screen);
+    app.last_hovered_index = hovered_index;
+    app.last_hover_key = layout_key;
+    hovered_index
+}
+
+fn hash_f32(hasher: &mut impl Hasher, value: f32) {
+    value.to_bits().hash(hasher);
+}
+
+/// 候选里下标最大且通过精确包含测试的卡片（堆叠前端在前）。
+fn frontmost_hit(candidates: &mut [usize], mut contains: impl FnMut(usize) -> bool) -> Option<usize> {
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    candidates.iter().copied().find(|i| contains(*i))
+}
+
+fn display_half(
+    app: &DeckRefApp,
+    index: usize,
+    n: usize,
+    scale_eff: f32,
+    is_board: bool,
+    board_ref_size: Vec2,
+) -> Vec2 {
+    let card = &app.cards[index];
+    let size = if is_board {
+        crate::image_card::StackLayout::effective_display_size_in_area(
+            card.intrinsic_size,
+            index,
+            n,
+            board_ref_size,
+        )
+    } else {
+        app.stack_layout
+            .effective_display_size(card.intrinsic_size, index, n)
+    };
+    size * scale_eff / 2.0
+}
+
+fn screen_aabb_key(
+    app: &DeckRefApp,
+    n: usize,
+    card_display: &[(Vec2, f32, f32)],
+    view: &ViewTransform,
+    is_board: bool,
+    board_ref_size: Vec2,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    n.hash(&mut hasher);
+    is_board.hash(&mut hasher);
+    hash_f32(&mut hasher, board_ref_size.x);
+    hash_f32(&mut hasher, board_ref_size.y);
+    let origin = view.world_to_screen(Pos2::ZERO);
+    let unit_x = view.world_to_screen(Pos2::new(1.0, 0.0));
+    let unit_y = view.world_to_screen(Pos2::new(0.0, 1.0));
+    for p in [origin, unit_x, unit_y] {
+        hash_f32(&mut hasher, p.x);
+        hash_f32(&mut hasher, p.y);
+    }
+    for i in 0..n {
+        let (pos, rot, scale_eff) = card_display[i];
+        hash_f32(&mut hasher, pos.x);
+        hash_f32(&mut hasher, pos.y);
+        hash_f32(&mut hasher, rot);
+        hash_f32(&mut hasher, scale_eff);
+        let half = display_half(app, i, n, scale_eff, is_board, board_ref_size);
+        hash_f32(&mut hasher, half.x);
+        hash_f32(&mut hasher, half.y);
+    }
+    hasher.finish()
+}
+
+fn ensure_screen_rtree(
+    app: &mut DeckRefApp,
+    n: usize,
+    card_display: &[(Vec2, f32, f32)],
+    view: &ViewTransform,
+    is_board: bool,
+    board_ref_size: Vec2,
+) {
+    let key = screen_aabb_key(app, n, card_display, view, is_board, board_ref_size);
+    if app.screen_rtree_key == Some(key) && app.screen_rtree.is_some() {
+        return;
+    }
+    let mut rects: Vec<CardScreenRect> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (world_pos, rot, scale_eff) = card_display[i];
+        let half = display_half(app, i, n, scale_eff, is_board, board_ref_size);
+        let world_center = Pos2::new(world_pos.x, world_pos.y);
+        let aabb = screen_aabb_for_rotated_rect(world_center, half, rot, |p| view.world_to_screen(p));
+        rects.push(CardScreenRect { index: i, aabb });
+    }
+    app.screen_rtree = Some(RTree::bulk_load(rects));
+    app.screen_rtree_key = Some(key);
+}
+
+fn hit_test_pointer(
+    app: &DeckRefApp,
+    pointer_screen: Pos2,
+    picked_up_index: Option<usize>,
+    n: usize,
+    card_display: &[(Vec2, f32, f32)],
+    world_pointer: Pos2,
+    is_board: bool,
+    board_ref_size: Vec2,
+) -> Option<usize> {
+    let tree = app.screen_rtree.as_ref()?;
+    let pad = HIT_TEST_QUERY_PADDING;
+    let envelope = AABB::from_corners(
+        [pointer_screen.x as f64 - pad, pointer_screen.y as f64 - pad],
+        [pointer_screen.x as f64 + pad, pointer_screen.y as f64 + pad],
+    );
+    let mut candidates: Vec<usize> = tree
+        .locate_in_envelope(&envelope)
+        .map(|rect| rect.index)
+        .filter(|index| Some(*index) != picked_up_index && *index < n)
+        .collect();
+    frontmost_hit(&mut candidates, |index| {
+        let (world_pos, rot, scale_eff) = card_display[index];
+        let half = display_half(app, index, n, scale_eff, is_board, board_ref_size);
+        rotated_rect_contains(Pos2::new(world_pos.x, world_pos.y), half, rot, world_pointer)
+    })
 }
 
 pub(super) fn update_card_animations(
@@ -165,7 +291,7 @@ pub(super) fn update_card_animations(
 }
 
 pub(super) fn compute_visible_indices(
-    app: &DeckRefApp,
+    app: &mut DeckRefApp,
     ui: &egui::Ui,
     n: usize,
     card_display: &[(Vec2, f32, f32)],
@@ -186,27 +312,10 @@ pub(super) fn compute_visible_indices(
             viewport_for_culling.max.y as f64,
         ],
     );
-    let mut rects: Vec<CardScreenRect> = Vec::with_capacity(n);
-    for (i, card) in app.cards.iter().enumerate() {
-        let (world_pos, rot, scale_eff) = card_display[i];
-        let world_center = Pos2::new(world_pos.x, world_pos.y);
-        let size = if is_board {
-            crate::image_card::StackLayout::effective_display_size_in_area(
-                card.intrinsic_size,
-                i,
-                n,
-                board_ref_size,
-            )
-        } else {
-            app.stack_layout
-                .effective_display_size(card.intrinsic_size, i, n)
-        };
-        let size = size * scale_eff;
-        let half = size / 2.0;
-        let aabb = screen_aabb_for_rotated_rect(world_center, half, rot, |p| view.world_to_screen(p));
-        rects.push(CardScreenRect { index: i, aabb });
-    }
-    let tree = RTree::bulk_load(rects);
+    ensure_screen_rtree(app, n, card_display, view, is_board, board_ref_size);
+    let Some(tree) = app.screen_rtree.as_ref() else {
+        return HashSet::new();
+    };
     tree.locate_in_envelope(&viewport_aabb)
         .filter_map(|r| {
             let card_area = r.aabb.area();

@@ -18,6 +18,9 @@ drag = "2"
 rand = "0.8"
 arboard = "3"
 rstar = "0.12"
+jpeg-decoder = "0.3"
+# static + 1_1：捆绑与头文件 ABI 0x0209 一致的 libwebp，JPEG/WebP 缩略图不依赖系统库。
+libwebp-sys2 = { version = "0.1", features = ["static", "1_1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

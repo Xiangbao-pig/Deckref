@@ -1,13 +1,97 @@
-//! 后台加载与纹理解码线程入口（与 UI 主线程通过 channel 通信）。
+//! 后台加载、纹理解码与监听 IO 线程入口（与 UI 主线程通过 channel 通信）。
 
+use crate::error::AppResult;
 use crate::image_ops;
 use crate::mode::AppMode;
 use crate::watcher::list_existing_image_paths_with_metadata;
+use crate::watcher::{WatchEvent, WatcherConfig};
 #[cfg(not(windows))]
 use crate::watcher::list_existing_image_paths;
+use eframe::egui;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::SystemTime;
+
+/// 后台线程在结果就绪时唤醒 UI。主线程每帧把当前 `Context` 写进来。
+pub(crate) type RepaintHook = Arc<Mutex<Option<egui::Context>>>;
+
+pub(crate) fn wake_ui(repaint: &RepaintHook) {
+    if let Ok(guard) = repaint.lock() {
+        if let Some(ctx) = guard.as_ref() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// 监听事件附带的尺寸与 metadata。主线程只用它构造卡片，不再自己读盘。
+pub(crate) struct WatchIoDone {
+    pub(crate) generation: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) dimensions: Option<(u32, u32)>,
+    pub(crate) file_size: u64,
+    pub(crate) modified: SystemTime,
+}
+
+pub(crate) fn run_watch_io_thread(
+    req_rx: mpsc::Receiver<(u64, PathBuf)>,
+    res_tx: mpsc::Sender<WatchIoDone>,
+    generation: Arc<AtomicU64>,
+    repaint: RepaintHook,
+) {
+    while let Ok((requested_generation, path)) = req_rx.recv() {
+        if requested_generation != generation.load(Ordering::Relaxed) {
+            continue;
+        }
+        let dimensions = image_ops::image_dimensions(&path).ok();
+        if requested_generation != generation.load(Ordering::Relaxed) {
+            continue;
+        }
+        let (file_size, modified) = std::fs::metadata(&path)
+            .map(|meta| (meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+            .unwrap_or((0, SystemTime::UNIX_EPOCH));
+        let done = WatchIoDone {
+            generation: requested_generation,
+            path,
+            dimensions,
+            file_size,
+            modified,
+        };
+        if res_tx.send(done).is_err() {
+            break;
+        }
+        wake_ui(&repaint);
+    }
+}
+
+/// 启动目录监听，并在事件到达时唤醒 UI，避免静止画面收不到新文件。
+pub(crate) fn spawn_waking_watcher(
+    watch_path: PathBuf,
+    extended_formats: bool,
+    repaint: RepaintHook,
+) -> AppResult<(mpsc::Receiver<WatchEvent>, thread::JoinHandle<AppResult<()>>)> {
+    let (tx, rx) = mpsc::channel();
+    let config = WatcherConfig {
+        watch_path,
+        extended_formats,
+        ..WatcherConfig::default()
+    };
+    let handle = crate::watcher::run_watcher(config, tx)?;
+    let (forward_tx, forward_rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("deckref-watch-forward".into())
+        .spawn(move || {
+            while let Ok(event) = rx.recv() {
+                if forward_tx.send(event).is_err() {
+                    break;
+                }
+                wake_ui(&repaint);
+            }
+        })
+        .map_err(|err| crate::error::AppError::Other(err.to_string()))?;
+    Ok((forward_rx, handle))
+}
 
 pub(crate) fn run_loader_thread(
     mode: AppMode,
@@ -17,9 +101,12 @@ pub(crate) fn run_loader_thread(
     max_cards: usize,
     inspiration_recent_max: usize,
     tx: mpsc::Sender<(PathBuf, (u32, u32), (u64, SystemTime))>,
+    repaint: RepaintHook,
 ) {
     let send = |path: PathBuf, w: u32, h: u32, file_size: u64, modified: SystemTime| {
-        let _ = tx.send((path, (w, h), (file_size, modified)));
+        if tx.send((path, (w, h), (file_size, modified))).is_ok() {
+            wake_ui(&repaint);
+        }
     };
     match mode {
         AppMode::Default => {
@@ -108,10 +195,13 @@ pub(crate) fn run_loader_thread(
 pub(crate) fn run_texture_loader_thread(
     req_rx: mpsc::Receiver<PathBuf>,
     res_tx: mpsc::Sender<(PathBuf, Vec<u8>, u32, u32)>,
+    repaint: RepaintHook,
 ) {
     for path in req_rx {
         if let Ok((rgba, w, h)) = image_ops::load_image_rgba_for_texture(&path) {
-            let _ = res_tx.send((path, rgba, w, h));
+            if res_tx.send((path, rgba, w, h)).is_ok() {
+                wake_ui(&repaint);
+            }
         }
     }
 }

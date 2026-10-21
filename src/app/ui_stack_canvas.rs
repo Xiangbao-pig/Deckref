@@ -41,12 +41,12 @@ pub(super) fn show(app: &mut DeckRefApp, ctx: &egui::Context, ui: &mut egui::Ui,
     stack_viewport::apply_scroll_zoom_when_not_picked(app, ui, screen_center, pointer);
 
     let card_display = stack_cull_draw::compute_card_display(app, n);
-    let world_pointer = pointer.map(|p| view.screen_to_world(p));
     let hovered_index = stack_cull_draw::compute_hovered_index(
         app,
         n,
         &card_display,
-        world_pointer,
+        pointer,
+        &view,
         is_board,
         board_ref_size,
     );
@@ -75,6 +75,7 @@ pub(super) fn show(app: &mut DeckRefApp, ctx: &egui::Context, ui: &mut egui::Ui,
         view.view_scale(),
     );
 
+    let world_pointer = pointer.map(|p| view.screen_to_world(p));
     stack_interaction::picked_up_frame_updates(app, ctx, ui, &card_display, world_pointer);
     stack_interaction::pointer_finish_select(
         app,
