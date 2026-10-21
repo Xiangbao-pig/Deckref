@@ -8,6 +8,8 @@
 
 ## 未发布
 
+- **2026-05-07** 重构（阶段 3）：中央堆叠区从 `app/mod.rs` 拆出为 `stack_viewport`（resize/平移、滚轮缩放、`ViewTransform`）、`stack_cull_draw`（几何、剔除、纹理请求、绘制与框选视觉）、`stack_interaction`（框选端点、长按拿起、跟手、松手与选中）；`ui_stack_canvas.rs` 编排 `CentralPanel` 内调用顺序，与拆分前一致（含「滚轮写入 app 前快照视口」）。涉及：`src/app/mod.rs`、`src/app/ui_stack_canvas.rs`、`src/app/stack_*.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+
 - **2026-05-07** 修复（Windows）：地址栏面包屑在盘符段使用 `F:` 而非 `F:\`，点击「F:」会进入该盘**当前工作目录**（若进程曾在 `F:\deckref` 下操作则表现为跳进 deckref），无法稳定回到盘根。现于 `path_breadcrumbs` 在 `Prefix` 后合并 `RootDir`，并在 `navigate_watch_path` / 地址栏 Enter 对单独盘符做规范化。涉及：`src/app_nav.rs`、`src/app/mod.rs`、`src/app/ui_top_bar.rs`。
 
 - **2026-05-07** 重构（阶段 2）：三层壳 UI 抽至 `app` 子模块 `ui_mode_sidebar`、`ui_top_bar`、`ui_bottom_bar`；布局常量归 `app_shell_layout.rs`；原 `src/app.rs` 改为 `src/app/mod.rs`。`run_ui` 调用顺序与原先一致（侧栏 → 中央 → 顶栏 → 底栏）。涉及：`src/lib.rs`、`src/app/`、`src/app_shell_layout.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。

@@ -20,7 +20,10 @@
 
 - **main.rs**：入口、窗口选项、CJK 字体加载、`DeckRefApp` 创建
 - **build.rs**（仅 Windows 构建）：从 `assets/icon.png` 或 `assets/main icon.png` 生成 `wix/DeckRef.ico` 并嵌入 exe（winres）；若无则内置绘制 logo。MSI 打包使用同一 ico。
-- **app/mod.rs**（模块 `app`）：`DeckRefApp` 状态、UI 主循环 `run_ui`、事件轮询、纹理缓存、中央堆叠区与交互
+- **app/mod.rs**（模块 `app`）：`DeckRefApp` 状态、UI 主循环 `run_ui`、事件轮询、纹理缓存；`CentralPanel` 内堆叠画布委托 **`app/ui_stack_canvas.rs`**
+- **app/stack_viewport.rs**：中央区视口补偿、中键/空格平移、未拿起时滚轮缩放；`ViewTransform`（本帧世界↔屏幕快照，与拆分前「滚轮前捕获的 offset/scale」语义一致）
+- **app/stack_cull_draw.rs**：空文件夹提示、首帧阵列、`card_display`、悬停命中、动画插值、R-Tree 视口剔除、可见纹理请求、卡片/拿起/框选绘制
+- **app/stack_interaction.rs**：框选端点更新、长按拿起与拿起时滚轮/跟手、松手放下与框选/单击选中
 - **app/ui_mode_sidebar.rs**、**app/ui_top_bar.rs**、**app/ui_bottom_bar.rs**：左侧模式条、顶栏地址栏与工具、底栏（`app` 子模块，可访问 `DeckRefApp` 私有字段）
 - **app_shell_layout.rs**：顶栏/底栏/模式侧栏共用像素常量
 - **app_nav.rs**（`crate` 内私有模块）：地址栏面包屑、盘符列表、折叠宽度计算
@@ -69,14 +72,11 @@ update() → run_ui(ctx, frame)
   → poll_watch_events()                  // try_recv 消费所有 pending
   → poll_loading_cards()                // 消费异步加载线程发来的卡片
   → poll_texture_results(ctx)           // 消费后台纹理解码结果，每帧最多 5 张 GPU 上传
-  → 底部栏 / CentralPanel UI
-  → 堆叠区域：
-       → 命中检测（从最前到最后，每卡 position_and_rotation + rotated_rect_contains）
-       → 每卡动画更新（lerp scale/rotation/position）
-       → 视口剔除：每卡屏幕 AABB 入 rstar R-Tree；**先用 R-Tree 查询与「视口 + 四周各 500px」相交的卡**（O(log N)），**仅对查询结果**做可见比例 = 相交面积/卡片面积，仅当可见比例 < 20% 时剔除（将面积计算从 N 次降到数十次）
-       → 仅对可见卡 ensure_texture（堆叠前端优先），仅对可见卡 draw_card；拿起卡恒参与
-       → 若有拿起卡，再绘制阴影 + 该卡
-       → 长按/拿起/松手/滚轮缩放等状态更新
+  → 模式侧栏 → CentralPanel（`ui_stack_canvas::show`）→ 顶栏 → 底栏
+  → 堆叠画布（`ui_stack_canvas` 内顺序，与历史 `app/mod.rs` 内联版一致）：
+       → stack_viewport：resize 补偿、平移、**滚轮写入前** `ViewTransform` 快照，再应用滚轮缩放
+       → stack_cull_draw：`card_display` → 命中检测（rotated_rect_contains）→ 动画 lerp → R-Tree 视口剔除（视口 + 500px，可见比例 < 20% 剔除）→ 可见卡 ensure_texture（堆叠前端优先）→ draw_card；拿起卡阴影与顶层绘制；框选高亮与进行中的选框
+       → stack_interaction：框选端点；绘制后长按超时→拿起、拿起时滚轮与跟手；松手放下与框选/单击选中
   → 若 drag_pending：canonicalize + drag::start_drag（主线程）
   → ctx.request_repaint()
 ```
