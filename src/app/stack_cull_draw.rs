@@ -256,8 +256,10 @@ fn hit_test_pointer(
         [pointer_screen.x as f64 - pad, pointer_screen.y as f64 - pad],
         [pointer_screen.x as f64 + pad, pointer_screen.y as f64 + pad],
     );
+    // `locate_in_envelope` 只返回完全落在查询框里的条目。指针附近只有几像素，
+    // 卡片包围盒远大于它，必须查相交，否则永远命不中、长按也拿不起来。
     let mut candidates: Vec<usize> = tree
-        .locate_in_envelope(&envelope)
+        .locate_in_envelope_intersecting(&envelope)
         .map(|rect| rect.index)
         .filter(|index| Some(*index) != picked_up_index && *index < n)
         .collect();
@@ -290,6 +292,13 @@ pub(super) fn update_card_animations(
     }
 }
 
+fn rect_aabb(rect: Rect) -> AABB<[f64; 2]> {
+    AABB::from_corners(
+        [rect.min.x as f64, rect.min.y as f64],
+        [rect.max.x as f64, rect.max.y as f64],
+    )
+}
+
 pub(super) fn compute_visible_indices(
     app: &mut DeckRefApp,
     ui: &egui::Ui,
@@ -299,31 +308,31 @@ pub(super) fn compute_visible_indices(
     is_board: bool,
     board_ref_size: Vec2,
 ) -> HashSet<usize> {
-    const VISIBLE_RATIO_THRESHOLD: f64 = 0.2;
+    const PREFETCH_RATIO_THRESHOLD: f64 = 0.2;
+    const MIN_PREFETCH_PIXELS: f64 = 64.0 * 64.0;
     const VIEWPORT_QUERY_PADDING: f32 = 500.0;
-    let viewport_for_culling = ui.clip_rect().expand2(Vec2::splat(VIEWPORT_QUERY_PADDING));
-    let viewport_aabb = AABB::from_corners(
-        [
-            viewport_for_culling.min.x as f64,
-            viewport_for_culling.min.y as f64,
-        ],
-        [
-            viewport_for_culling.max.x as f64,
-            viewport_for_culling.max.y as f64,
-        ],
-    );
+    let screen = ui.clip_rect();
+    let padded = screen.expand2(Vec2::splat(VIEWPORT_QUERY_PADDING));
+    let screen_aabb = rect_aabb(screen);
+    let padded_aabb = rect_aabb(padded);
     ensure_screen_rtree(app, n, card_display, view, is_board, board_ref_size);
     let Some(tree) = app.screen_rtree.as_ref() else {
         return HashSet::new();
     };
-    tree.locate_in_envelope(&viewport_aabb)
+    // 放大后的卡片比查询框还大，不能用「完全包含」。相交才会把露出一角的图算进来。
+    tree.locate_in_envelope_intersecting(&padded_aabb)
         .filter_map(|r| {
             let card_area = r.aabb.area();
             if card_area <= 0.0 {
                 return Some(r.index);
             }
-            let inter = r.aabb.intersection_area(&viewport_aabb);
-            if inter / card_area >= VISIBLE_RATIO_THRESHOLD {
+            // 只要有像素落在真正的窗口里就保留。放大后窗口往往只盖住大图的一小块，
+            // 不能再用「相交面积 / 整张图面积 < 20%」把正在看的图裁掉。
+            if r.aabb.intersection_area(&screen_aabb) > 0.0 {
+                return Some(r.index);
+            }
+            let prefetched = r.aabb.intersection_area(&padded_aabb);
+            if prefetched >= MIN_PREFETCH_PIXELS || prefetched / card_area >= PREFETCH_RATIO_THRESHOLD {
                 Some(r.index)
             } else {
                 None
@@ -332,28 +341,48 @@ pub(super) fn compute_visible_indices(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn request_textures_for_visible(
     app: &mut DeckRefApp,
     ctx: &egui::Context,
     n: usize,
+    card_display: &[(Vec2, f32, f32)],
     visible_indices: &HashSet<usize>,
+    is_board: bool,
+    board_ref_size: Vec2,
+    view_scale: f32,
 ) {
-    let paths_to_load: Vec<PathBuf> = app
+    let layout = &app.stack_layout;
+    let jobs: Vec<(PathBuf, u32)> = app
         .cards
         .iter()
         .rev()
         .enumerate()
-        .filter_map(|(rev_i, c)| {
+        .filter_map(|(rev_i, card)| {
             let index = n - 1 - rev_i;
-            if visible_indices.contains(&index) {
-                Some(c.path.clone())
-            } else {
-                None
+            if !visible_indices.contains(&index) {
+                return None;
             }
+            let scale_eff = card_display.get(index).map(|(_, _, scale)| *scale).unwrap_or(1.0);
+            let base = if is_board {
+                crate::image_card::StackLayout::effective_display_size_in_area(
+                    card.intrinsic_size,
+                    index,
+                    n,
+                    board_ref_size,
+                )
+            } else {
+                layout.effective_display_size(card.intrinsic_size, index, n)
+            };
+            let screen = base * scale_eff * view_scale;
+            let screen_longest = screen.x.max(screen.y);
+            let intrinsic = card.intrinsic_size.x.max(card.intrinsic_size.y).max(1.0) as u32;
+            let edge = crate::image_ops::texture_edge_for_screen(screen_longest).min(intrinsic);
+            Some((card.path.clone(), edge))
         })
         .collect();
-    for path in &paths_to_load {
-        let _ = app.ensure_texture(ctx, path);
+    for (path, edge) in jobs {
+        let _ = app.ensure_texture(ctx, &path, edge);
     }
 }
 

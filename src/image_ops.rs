@@ -115,11 +115,26 @@ pub fn load_image(path: &Path) -> AppResult<DynamicImage> {
     image::load_from_memory_with_format(&data, format).map_err(AppError::Image)
 }
 
-/// 当原图最长边超过此值时，使用缩略图加载以节省内存与解码时间（2K 屏上仍显示为高清）。
+/// 当原图最长边超过此值时，禁止退回完整像素解码。
 pub const THUMBNAIL_RESOLUTION_THRESHOLD: u32 = 2048;
 
-/// 缩略图最长边像素数，保证在 2K（2560×1440）屏上堆叠预览仍清晰。
-pub const THUMBNAIL_MAX_LONGEST_EDGE: u32 = 1200;
+/// 堆叠总览用的缩略图最长边。单反原图在格子里通常只有几百像素，先解码到这个尺寸。
+pub const THUMBNAIL_MAX_LONGEST_EDGE: u32 = 512;
+
+/// 单张在屏幕上放得很大时，纹理最长边的上限。只给真正放大的那几张，不给整夹照片。
+pub const DETAIL_TEXTURE_MAX_LONGEST_EDGE: u32 = 1600;
+
+/// 按卡片在屏幕上的最长边选择纹理档位：总览 512，中等 1024，放得很大才到 1600。
+pub fn texture_edge_for_screen(screen_longest: f32) -> u32 {
+    let need = screen_longest.ceil().max(1.0) as u32;
+    if need <= THUMBNAIL_MAX_LONGEST_EDGE {
+        THUMBNAIL_MAX_LONGEST_EDGE
+    } else if need <= 1024 {
+        1024
+    } else {
+        DETAIL_TEXTURE_MAX_LONGEST_EDGE
+    }
+}
 
 /// JPEG / WebP 可以在解码时按目标边长缩小，从而不必先得到整幅像素缓冲。
 /// PNG、PSD、TIFF 等格式没有等价的解码期下采样，仍走解码后再缩放。
@@ -382,7 +397,6 @@ unsafe fn copy_webp_rgba(
 }
 
 /// 加载图片并缩放到最长边不超过 `max_longest_edge` 的缩略图；若原图已更小则不缩放。
-/// 用于高分辨率大图（如单反 50MB）的堆叠预览，在保证 2K 屏清晰的前提下显著降低解码与显存占用。
 /// JPEG / WebP 在需要缩小时走解码期下采样；其余格式仍先解码再缩放。
 pub fn load_image_thumbnail(path: &Path, max_longest_edge: u32) -> AppResult<DynamicImage> {
     let (width, height) = image_dimensions(path)?;
@@ -409,13 +423,8 @@ pub fn load_image_thumbnail(path: &Path, max_longest_edge: u32) -> AppResult<Dyn
     Ok(resize_down_to_longest(img, max_longest_edge))
 }
 
-pub fn load_image_rgba_for_texture(path: &Path) -> AppResult<(Vec<u8>, u32, u32)> {
-    let (w, h) = image_dimensions(path)?;
-    let img = if w.max(h) > THUMBNAIL_RESOLUTION_THRESHOLD {
-        load_image_thumbnail(path, THUMBNAIL_MAX_LONGEST_EDGE)?
-    } else {
-        load_image(path)?
-    };
+pub fn load_image_rgba_for_texture(path: &Path, max_longest_edge: u32) -> AppResult<(Vec<u8>, u32, u32)> {
+    let img = load_image_thumbnail(path, max_longest_edge.max(1))?;
     let (width, height) = (img.width(), img.height());
     let rgba = img.to_rgba8();
     Ok((rgba.into_raw(), width, height))
@@ -655,10 +664,15 @@ mod tests {
     #[test]
     fn oversized_jpeg_never_selects_full_idct() {
         assert_ne!(choose_jpeg_idct_scale(4000, 3000, THUMBNAIL_MAX_LONGEST_EDGE), 8);
-        assert_eq!(choose_jpeg_idct_scale(4000, 3000, THUMBNAIL_MAX_LONGEST_EDGE), 4);
-        // 1/2 of 2200 is under 1200; still must not fall back to a full decode.
-        assert_eq!(choose_jpeg_idct_scale(2200, 1400, THUMBNAIL_MAX_LONGEST_EDGE), 4);
-        assert_eq!(choose_jpeg_idct_scale(800, 600, THUMBNAIL_MAX_LONGEST_EDGE), 8);
+        assert_eq!(choose_jpeg_idct_scale(4000, 3000, THUMBNAIL_MAX_LONGEST_EDGE), 2);
+        assert_eq!(choose_jpeg_idct_scale(6000, 4000, THUMBNAIL_MAX_LONGEST_EDGE), 1);
+        // 目标边 1200 时仍用 1/2，不能退回完整 IDCT。
+        assert_eq!(choose_jpeg_idct_scale(4000, 3000, 1200), 4);
+        assert_eq!(choose_jpeg_idct_scale(2200, 1400, 1200), 4);
+        assert_eq!(choose_jpeg_idct_scale(800, 600, 1200), 8);
+        assert_eq!(texture_edge_for_screen(180.0), THUMBNAIL_MAX_LONGEST_EDGE);
+        assert_eq!(texture_edge_for_screen(700.0), 1024);
+        assert_eq!(texture_edge_for_screen(1400.0), DETAIL_TEXTURE_MAX_LONGEST_EDGE);
     }
 
     #[test]

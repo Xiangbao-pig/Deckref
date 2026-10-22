@@ -2,8 +2,8 @@
 
 use super::DeckRefApp;
 use crate::app_nav::{
-    breadcrumb_collapse_start, list_drives_windows, list_subdirs, path_breadcrumbs,
-    THIS_PC_SENTINEL,
+    breadcrumb_collapse_start, breadcrumb_label, list_child_folders, path_breadcrumbs,
+    this_pc_entries, THIS_PC_SENTINEL,
 };
 use crate::app_shell_layout::TOP_BAR_HEIGHT;
 use crate::image_card::CardSortOrder;
@@ -94,11 +94,25 @@ pub(super) fn show_top_bar(app: &mut DeckRefApp, ctx: &egui::Context) {
                     {
                         app.nav_forward();
                     }
+                    let parent = PathBuf::from(&app.watch_path)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .filter(|p| p.is_dir());
+                    if ui
+                        .add_enabled(parent.is_some(), egui::Button::new(" ↑ ").frame(false))
+                        .on_hover_text("向上一级")
+                        .clicked()
+                    {
+                        if let Some(parent) = parent {
+                            app.navigate_watch_path(parent, true);
+                        }
+                    }
                     ui.add_space(4.0);
 
                     if app.address_bar_editing {
                         let id = egui::Id::new("addr_bar_edit");
-                        if app.address_bar_edit_request_focus {
+                        let select_all = app.address_bar_edit_request_focus;
+                        if select_all {
                             ui.ctx().memory_mut(|m| m.request_focus(id));
                             app.address_bar_edit_request_focus = false;
                         }
@@ -107,184 +121,95 @@ pub(super) fn show_top_bar(app: &mut DeckRefApp, ctx: &egui::Context) {
                             .desired_width(ui.available_width().min(500.0))
                             .font(egui::TextStyle::Body);
                         let resp = ui.add(te);
-                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let s = app.address_bar_edit_text.trim();
-                            if !s.is_empty() {
-                                let p = PathBuf::from(s);
-                                let p = crate::app_nav::normalize_watch_path_for_nav(p);
-                                let path = std::fs::canonicalize(&p).unwrap_or(p);
-                                if path.is_dir() {
-                                    app.navigate_watch_path(path, true);
-                                }
+                        if select_all {
+                            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                                let end = egui::text::CCursor::new(app.address_bar_edit_text.chars().count());
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    end,
+                                )));
+                                state.store(ui.ctx(), id);
                             }
+                        }
+                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if enter {
+                            commit_address_edit(app);
+                            app.address_bar_editing = false;
+                        } else if escape {
+                            app.address_bar_editing = false;
+                        } else if resp.lost_focus() {
+                            commit_address_edit(app);
                             app.address_bar_editing = false;
                         }
-                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            app.address_bar_editing = false;
-                        }
-                        if resp.lost_focus() {
-                            app.address_bar_editing = false;
-                        }
-                        let _ = resp;
                     } else {
                         let watch_path_buf = PathBuf::from(&app.watch_path);
                         let segments = path_breadcrumbs(&watch_path_buf);
+                        let labels: Vec<String> = segments
+                            .iter()
+                            .map(|(path, fallback)| breadcrumb_label(path, fallback))
+                            .collect();
                         let arrow_color = ui.visuals().weak_text_color();
                         let screen_w = ui.ctx().screen_rect().width();
                         const RESERVE_LEFT_RIGHT: f32 = 280.0;
                         let avail_breadcrumb = (screen_w - RESERVE_LEFT_RIGHT).max(40.0);
-                        let (start_index, _seg_widths, _sep_w, _ellipsis_btn_w) =
-                            breadcrumb_collapse_start(ui, &segments, avail_breadcrumb);
+                        let (start_index, _) = breadcrumb_collapse_start(ui, &labels, avail_breadcrumb);
+                        let chevron = egui::RichText::new("›").size(14.0).color(arrow_color);
 
                         let _ = ui.allocate_ui_with_layout(
                             egui::Vec2::new(avail_breadcrumb, TOP_BAR_HEIGHT),
-                            egui::Layout::left_to_right(egui::Align::Min),
+                            egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
-                                egui::ScrollArea::horizontal()
-                                    .id_salt("addr_bar_breadcrumb")
-                                    .max_height(TOP_BAR_HEIGHT - 4.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            if start_index > 0 {
-                                                let resp = egui::menu::menu_button(
-                                                    ui,
-                                                    egui::RichText::new("…").size(12.0).color(arrow_color),
-                                                    |ui| {
-                                                        ui.set_max_width(280.0);
-                                                        ui.set_max_height(200.0);
-                                                        egui::ScrollArea::vertical().show(ui, |ui| {
-                                                            for (path, label) in segments.iter().take(start_index) {
-                                                                let label_str = label.to_string_lossy();
-                                                                if ui.button(label_str.as_ref()).clicked() {
-                                                                    if path.as_os_str() != THIS_PC_SENTINEL
-                                                                        && path.is_dir()
-                                                                    {
-                                                                        app.navigate_watch_path(path.clone(), true);
-                                                                    }
-                                                                    ui.close_menu();
-                                                                }
-                                                            }
-                                                        });
-                                                    },
-                                                );
-                                                if resp.response.hovered() {
-                                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                                }
-                                                resp.response.on_hover_text("被省略的上级路径，点击可跳转");
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(" › ").color(arrow_color),
-                                                    )
-                                                    .selectable(false),
-                                                );
-                                            }
-                                            for (i, (path, label)) in segments.iter().enumerate() {
-                                                if i < start_index {
-                                                    continue;
-                                                }
-                                                let is_sentinel = path.as_os_str() == THIS_PC_SENTINEL;
-                                                let is_current = i == segments.len() - 1;
-                                                let label_str = label.to_string_lossy();
-                                                let style = if is_current {
-                                                    egui::RichText::new(label_str.as_ref()).size(12.0).strong()
-                                                } else {
-                                                    egui::RichText::new(label_str.as_ref()).size(12.0)
-                                                };
-
-                                                let seg_btn =
-                                                    egui::Button::new(style).frame(true).min_size(egui::Vec2::ZERO);
-                                                let seg_resp = ui.add(seg_btn);
-                                                if seg_resp.hovered() {
-                                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                                }
-                                                if seg_resp.clicked() {
-                                                    if is_sentinel {
-                                                        #[cfg(windows)]
-                                                        {
-                                                            let drives = list_drives_windows();
-                                                            if let Some(first) = drives.first() {
-                                                                app.navigate_watch_path(first.clone(), true);
-                                                            }
-                                                        }
-                                                    } else if path.is_dir() {
-                                                        app.navigate_watch_path(path.clone(), true);
-                                                    }
-                                                }
-                                                seg_resp.on_hover_text(if is_current {
-                                                    "当前监听目录"
-                                                } else {
-                                                    "点击切换到该目录"
-                                                });
-
-                                                if is_sentinel {
-                                                    #[cfg(windows)]
-                                                    {
-                                                        let drives = list_drives_windows();
-                                                        egui::menu::menu_button(
-                                                            ui,
-                                                            egui::RichText::new(" › ").color(arrow_color),
-                                                            |ui| {
-                                                                ui.set_max_width(200.0);
-                                                                ui.set_max_height(200.0);
-                                                                egui::ScrollArea::vertical().show(ui, |ui| {
-                                                                    for drive in &drives {
-                                                                        let name = drive.display().to_string();
-                                                                        if ui.button(name.as_str()).clicked() {
-                                                                            app.navigate_watch_path(drive.clone(), true);
-                                                                            ui.close_menu();
-                                                                        }
-                                                                    }
-                                                                });
-                                                            },
-                                                        );
-                                                    }
-                                                    #[cfg(not(windows))]
-                                                    {
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                egui::RichText::new(" › ").color(arrow_color),
-                                                            )
-                                                            .selectable(false),
-                                                        );
-                                                    }
-                                                } else {
-                                                    let subdirs = list_subdirs(path, 80);
-                                                    if !subdirs.is_empty() {
-                                                        egui::menu::menu_button(
-                                                            ui,
-                                                            egui::RichText::new(" › ").color(arrow_color),
-                                                            |ui| {
-                                                                ui.set_max_width(220.0);
-                                                                ui.set_max_height(200.0);
-                                                                egui::ScrollArea::vertical().show(ui, |ui| {
-                                                                    for subdir in &subdirs {
-                                                                        let name = subdir
-                                                                            .file_name()
-                                                                            .unwrap_or_default()
-                                                                            .to_string_lossy();
-                                                                        if ui.button(name.as_ref()).clicked() {
-                                                                            app.navigate_watch_path(
-                                                                                subdir.clone(),
-                                                                                true,
-                                                                            );
-                                                                            ui.close_menu();
-                                                                        }
-                                                                    }
-                                                                });
-                                                            },
-                                                        );
-                                                    } else {
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                egui::RichText::new(" › ").color(arrow_color),
-                                                            )
-                                                            .selectable(false),
-                                                        );
-                                                    }
-                                                }
-                                            }
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    if start_index > 0 {
+                                        let hidden: Vec<(PathBuf, String)> = segments
+                                            .iter()
+                                            .take(start_index)
+                                            .zip(labels.iter())
+                                            .map(|((path, _), label)| (path.clone(), label.clone()))
+                                            .collect();
+                                        let resp = egui::menu::menu_button(ui, chevron.clone(), |ui| {
+                                            fill_breadcrumb_menu(ui, &hidden, app);
                                         });
-                                    });
+                                        if resp.response.hovered() {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        resp.response.on_hover_text("被收起的上级文件夹");
+                                    }
+                                    for i in start_index..segments.len() {
+                                        let path = segments[i].0.clone();
+                                        let is_sentinel = path.as_os_str() == THIS_PC_SENTINEL;
+                                        let style = egui::RichText::new(&labels[i]).size(12.0);
+                                        let seg_btn = egui::Button::new(style).frame(false).min_size(egui::Vec2::ZERO);
+                                        let seg_resp = ui.add(seg_btn);
+                                        if seg_resp.hovered() {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        if seg_resp.clicked() && !is_sentinel && path.is_dir() {
+                                            app.navigate_watch_path(path.clone(), true);
+                                        }
+                                        seg_resp.on_hover_text(if is_sentinel {
+                                            "此电脑"
+                                        } else if i + 1 == segments.len() {
+                                            "当前文件夹"
+                                        } else {
+                                            "打开此文件夹"
+                                        });
+                                        let resp = egui::menu::menu_button(ui, chevron.clone(), |ui| {
+                                            let entries = if is_sentinel {
+                                                this_pc_entries()
+                                            } else {
+                                                list_child_folders(&path)
+                                            };
+                                            fill_breadcrumb_menu(ui, &entries, app);
+                                        });
+                                        if resp.response.hovered() {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        resp.response.on_hover_text("此位置中的文件夹");
+                                    }
+                                });
                             },
                         );
 
@@ -343,4 +268,40 @@ pub(super) fn show_top_bar(app: &mut DeckRefApp, ctx: &egui::Context) {
                 });
             });
         });
+}
+
+fn commit_address_edit(app: &mut DeckRefApp) {
+    let typed = app.address_bar_edit_text.trim();
+    if typed.is_empty() {
+        return;
+    }
+    let parsed = crate::app_nav::normalize_watch_path_for_nav(PathBuf::from(typed));
+    let path = std::fs::canonicalize(&parsed).unwrap_or(parsed);
+    if !path.is_dir() {
+        return;
+    }
+    let current = std::fs::canonicalize(PathBuf::from(&app.watch_path)).unwrap_or_else(|_| PathBuf::from(&app.watch_path));
+    if path == current {
+        return;
+    }
+    app.navigate_watch_path(path, true);
+}
+
+fn fill_breadcrumb_menu(ui: &mut egui::Ui, entries: &[(PathBuf, String)], app: &mut DeckRefApp) {
+    ui.set_min_width(180.0);
+    ui.set_max_width(420.0);
+    ui.set_max_height(360.0);
+    if entries.is_empty() {
+        return;
+    }
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for (path, label) in entries {
+            if ui.button(label).clicked() {
+                if path.as_os_str() != THIS_PC_SENTINEL && path.is_dir() {
+                    app.navigate_watch_path(path.clone(), true);
+                }
+                ui.close_menu();
+            }
+        }
+    });
 }

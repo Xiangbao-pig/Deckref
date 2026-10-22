@@ -61,7 +61,16 @@ pub(super) fn show(app: &mut DeckRefApp, ctx: &egui::Context, ui: &mut egui::Ui,
         is_board,
         board_ref_size,
     );
-    stack_cull_draw::request_textures_for_visible(app, ctx, n, &visible_indices);
+    stack_cull_draw::request_textures_for_visible(
+        app,
+        ctx,
+        n,
+        &card_display,
+        &visible_indices,
+        is_board,
+        board_ref_size,
+        view.view_scale(),
+    );
     stack_cull_draw::draw_cards_marquee_and_held(
         app,
         ui,

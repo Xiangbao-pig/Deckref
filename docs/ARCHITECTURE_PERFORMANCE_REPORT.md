@@ -75,7 +75,7 @@ update() → run_ui(ctx, frame)
   → 模式侧栏 → CentralPanel（`ui_stack_canvas::show`）→ 顶栏 → 底栏
   → 堆叠画布（`ui_stack_canvas` 内顺序，与历史 `app/mod.rs` 内联版一致）：
        → stack_viewport：resize 补偿、平移、**滚轮写入前** `ViewTransform` 快照，再应用滚轮缩放
-       → stack_cull_draw：`card_display` → 命中检测（R-Tree 指针包络 + `rotated_rect_contains`，布局未变时复用上一帧树与悬停结果）→ 动画 lerp → 同一棵 R-Tree 做视口剔除（视口 + 500px，可见比例 < 20% 剔除）→ 可见卡 ensure_texture（堆叠前端优先）→ draw_card；拿起卡阴影与顶层绘制；框选高亮与进行中的选框
+       → stack_cull_draw：`card_display` → 命中检测（R-Tree 指针包络 + `rotated_rect_contains`，布局未变时复用上一帧树与悬停结果）→ 动画 lerp → 同一棵 R-Tree 做视口剔除（与窗口相交就保留；窗外 500px 只预取够大的一块）→ 可见卡按屏幕尺寸要 512/1024/1600 纹理（堆叠前端优先）→ draw_card；拿起卡阴影与顶层绘制；框选高亮与进行中的选框
        → stack_interaction：框选端点；绘制后长按超时→拿起、拿起时滚轮与跟手；松手放下与框选/单击选中
   → 若 drag_pending：canonicalize + drag::start_drag（主线程）
   → 仅在拿起/拖动/动画未收敛/加载或纹理 pending/监听 IO 未回时 `request_repaint`；Shift 截图窗口与画板布局防抖用 `request_repaint_after`
@@ -83,15 +83,15 @@ update() → run_ui(ctx, frame)
 
 - **request_repaint** 不再每帧调用。静止堆叠（含已经平移或缩放后停住的画面）不空转；后台加载、纹理解码、监听 IO 完成时由工作线程唤醒 UI。
 - 监听 Create/Modify/Remove 只把路径交给 `deckref-watch-io` 读尺寸与 metadata，主线程用 `from_path_with_metadata` 建卡。切换文件夹时 generation 递增，丢掉过期结果。
-- JPEG / WebP 缩略图在最长边超过 2048 时于解码期缩小到最长边 1200 附近，避免先得到整幅像素缓冲。PNG 等格式仍是解码后再缩放。主线程回退路径不对超大的非 JPEG/WebP 做完整解码。
+- JPEG / WebP 缩略图在解码期按目标边长缩小。总览档最长边 512，单张在屏幕上更大时才升到 1024 或 1600，避免一夹单反同时上传几十张 1200px 纹理。PNG 等格式仍是解码后再缩放。主线程回退路径不对超大的非 JPEG/WebP 做完整解码。
 - 所有输入、布局、纹理上传、绘制均在**主线程**。尺寸、metadata 与像素解码在后台线程。
 
 ### 2.3 纹理加载（ensure_texture）
 
 - 使用 `HashMap<PathBuf, TextureHandle>` 作为纹理缓存；**清理模式**：仅保留最近 **MAX_TEXTURE_CACHE_FOLDERS（10）个文件夹**的纹理，按「最近使用」顺序维护 `texture_cache_scope`，超过时淘汰最久未访问的文件夹下全部纹理，控制显存与内存。切换至未缓存文件夹或点击「清空」时清空 cache、scope 与 `pending_texture_paths`。
 - **前后端分离**：纹理解码在后台线程 `deckref-tex-loader` 完成（`image_ops::load_image_rgba_for_texture`：大图缩略图），主线程只做 `ColorImage::from_rgba_unmultiplied` + `ctx.load_texture`。`ensure_texture` 未命中时仅将 path 发送到 `texture_loading_tx` 并加入 `pending_texture_paths`，本帧返回 None；每帧 `poll_texture_results` 从 `texture_loading_rx` 取最多 **UPLOADS_PER_FRAME（5）** 个结果，仅当 path 仍属于当前 `cards` 时上传并插入 cache，避免切换文件夹后仍写入旧纹理。请求顺序为堆叠前端优先（`cards.iter().rev()`），可见图先出现。
-- **缩略图**：高分辨率大图（如单反 50MB）在堆叠预览时只加载 1200px 最长边的缩略图，保证 2K 屏清晰且降低解码与显存；原图仍用于布局尺寸（intrinsic_size 来自启动时 dimensions）。
-- **每帧**仅对**视口内**卡片的 path 调用 `ensure_texture`（rstar 视口剔除）；未命中且后台可用时只发请求不阻塞；主线程不再在本帧内做解码，仅在上传完成的帧重绘。**主线程回退**（loader spawn 失败时）：仍用 `load_image_thumbnail` 处理 >2048px 大图，主线程绝不完整解码超大图。
+- **缩略图**：高分辨率大图（如单反）在堆叠总览时只加载最长边 512px 的缩略图。卡片在屏幕上的最长边超过当前纹理时，再单独换成 1024 或 1600。原图仍用于布局尺寸（intrinsic_size 来自启动时 dimensions）。
+- **每帧**仅对**视口内**卡片的 path 调用 `ensure_texture`（rstar 视口剔除；与窗口相交即可见）；未命中且后台可用时只发请求不阻塞；主线程不再在本帧内做解码，仅在上传完成的帧重绘。**主线程回退**（loader spawn 失败时）：仍用 `load_image_thumbnail` 按目标边长缩小，主线程绝不完整解码超大图。
 
 ~~**后续可进一步优化**：视口剔除（仅对可能可见的卡请求纹理）；~~ **已实施**：rstar + clip_rect 视口剔除，且屏幕 AABB 未变时复用同一棵 R-Tree。每帧 path 复用减少分配；`UPLOADS_PER_FRAME` 可配置。监听事件的 dimensions/metadata 已移入 `deckref-watch-io`。
 
@@ -118,11 +118,12 @@ update() → run_ui(ctx, frame)
    - 剪贴板：每 `CLIPBOARD_POLL_INTERVAL`（0.8s）在主线程读一次剪贴板并哈希；偶发系统 API 阻塞时可能短时卡顿，频率已节流。
 
 2. **纹理与图片**
-   - ~~纹理为**原图**解码，显示尺寸由 `effective_display_size` 缩小，存在「大图小显」的显存与解码成本。~~ **已优化**：最长边 > 2048px 时 JPEG/WebP 在解码期缩小（IDCT 1/2、1/4、1/8 或 libwebp `use_scaling`），再 CatmullRom 到最长边 1200px；其余格式仍解码后缩放。主线程回退不对超大的非 JPEG/WebP 做完整解码。
+   - ~~纹理为**原图**解码，显示尺寸由 `effective_display_size` 缩小，存在「大图小显」的显存与解码成本。~~ **已优化**：JPEG/WebP 在解码期缩小（IDCT 1/2、1/4、1/8 或 libwebp `use_scaling`）。总览先到最长边 512px；屏幕上放得更大才升到 1024 或 1600。其余格式仍解码后缩放。主线程回退不对超大的非 JPEG/WebP 做完整解码。
+   - 视口剔除：与窗口有任何相交就绘制。放大后窗口只盖住大图的一角时不再整张消失。窗外 500px 的预取仍要求相交面积够一块（至少约 64×64，或占该图 20%）。
    - 首展或批量加入时，仅可见卡会请求纹理；未命中由后台解码，主线程只做上传。
 
 3. **每帧分配与 work**
-   - 视口剔除后仅对可见卡做 ensure_texture 与绘制。屏幕 AABB 未变时复用上一帧 R-Tree，不再每帧 `bulk_load`。命中检测先查指针附近的包络，再对候选做旋转矩形测试。
+   - 视口剔除后仅对可见卡做 ensure_texture 与绘制。屏幕 AABB 未变时复用上一帧 R-Tree，不再每帧 `bulk_load`。命中检测先查与指针附近包络相交的卡片（不是完全包含），再对候选做旋转矩形测试。
    - ~~对全部卡片做命中检测、动画更新、ensure_texture；无视口剔除或 LOD，卡片数固定上限 80。~~ **已优化**：rstar 视口剔除，仅可见卡请求纹理与绘制。
 
 4. **IO 重复与一致性**

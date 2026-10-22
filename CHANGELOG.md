@@ -8,6 +8,12 @@
 
 ## 未发布
 
+- **2026-10-23** 修复：长按拿不起图片。命中和视口查询误用了「完全落在范围内」，指针旁边的小范围里放不下一张卡片，所以点不中。改为查相交。涉及：`src/app/stack_cull_draw.rs`。
+
+- **2026-10-23** 地址栏按 Windows 11：点文件夹名进入该级，点名称右侧箭头才在箭头下方列出子文件夹；「此电脑」列出桌面、文档、下载、音乐、图片、视频和带卷标的磁盘；名称用资源管理器显示名；放不下时左侧箭头列出被收起的上级；后退/前进旁边有向上一级。涉及：`src/app/ui_top_bar.rs`、`src/app_nav.rs`、`docs/INTERACTIONS.md`。
+
+- **2026-10-23** 性能：照片夹先用最长边 512 的总览缩略图，只有单张在屏幕上放得超过这个尺寸才升到 1024 或 1600。放大后只要图片还有像素留在窗口里就继续画，不再因为「露出面积不到整张的 20%」被整张裁掉。操作方式不变。涉及：`src/image_ops.rs`、`src/app/mod.rs`、`src/app/stack_cull_draw.rs`、`src/app_threads.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
+
 - **2026-10-22** 性能（移植到 0.3.3，交互不变）：大图 JPEG/WebP 在解码期按目标边长缩小；屏幕 AABB 未变时复用 R-Tree，命中先查指针附近再做旋转矩形测试；监听事件的尺寸与 metadata 改到 `deckref-watch-io`；静止且没有动画/加载时不再每帧 `request_repaint`。涉及：`src/image_ops.rs`、`src/app/mod.rs`、`src/app/stack_cull_draw.rs`、`src/app_threads.rs`、`Cargo.toml`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。
 
 - **2026-05-07** 重构（阶段 3）：中央堆叠区从 `app/mod.rs` 拆出为 `stack_viewport`（resize/平移、滚轮缩放、`ViewTransform`）、`stack_cull_draw`（几何、剔除、纹理请求、绘制与框选视觉）、`stack_interaction`（框选端点、长按拿起、跟手、松手与选中）；`ui_stack_canvas.rs` 编排 `CentralPanel` 内调用顺序，与拆分前一致（含「滚轮写入 app 前快照视口」）。涉及：`src/app/mod.rs`、`src/app/ui_stack_canvas.rs`、`src/app/stack_*.rs`、`docs/ARCHITECTURE_PERFORMANCE_REPORT.md`。

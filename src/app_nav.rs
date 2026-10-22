@@ -4,8 +4,10 @@ use eframe::egui;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-/// 面包屑根「此台电脑」的占位路径，不参与真实导航，仅用于展开盘符列表（Windows）
+/// 面包屑根「此电脑」的占位路径。它不是真实目录，只用来展开和资源管理器一样的「此电脑」列表。
 pub(crate) const THIS_PC_SENTINEL: &str = "::THIS_PC::";
+
+pub(crate) const THIS_PC_LABEL: &str = "此电脑";
 
 /// 面包屑单段按钮水平内边距（用于宽度估算）
 const BREADCRUMB_BTN_PADDING_X: f32 = 16.0;
@@ -83,75 +85,214 @@ pub(crate) fn path_breadcrumbs(path: &Path) -> Vec<(PathBuf, OsString)> {
     }
     #[cfg(windows)]
     if !out.is_empty() {
-        out.insert(0, (PathBuf::from(THIS_PC_SENTINEL), OsString::from("此台电脑")));
+        out.insert(0, (PathBuf::from(THIS_PC_SENTINEL), OsString::from(THIS_PC_LABEL)));
     }
     out
 }
 
-/// 列出指定目录下的子文件夹（按名称排序，最多 limit 个）。用于面包屑每级右侧的下拉菜单。
-pub(crate) fn list_subdirs(path: &Path, limit: usize) -> Vec<PathBuf> {
-    let mut d: Vec<PathBuf> = match std::fs::read_dir(path) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.path())
-            .collect(),
-        Err(_) => return vec![],
-    };
-    d.sort_by_cached_key(|p| p.file_name().unwrap_or_default().to_string_lossy().to_lowercase());
-    d.truncate(limit);
-    d
+/// 资源管理器里的显示名。盘符会变成「本地磁盘 (C:)」，特殊文件夹会变成「图片」这类名称。
+pub(crate) fn shell_display_name(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(name) = windows_display_name(path) {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
-/// 计算面包屑在空间不足时从左侧折叠的起始索引（参考 Win11 资源管理器：保留右侧，左侧用省略号）。
-/// 当窗口足够长、可用宽度能容纳完整路径时，自动展开显示全部段落（start_index = 0）。
-/// 返回 (start_index, 各段宽度, 分隔符宽度, 省略号按钮宽度)。start_index > 0 时表示需显示 "…" 并只显示 segments[start_index..]。
+/// 面包屑上这一段的文字。根是「此电脑」，其余用资源管理器显示名。
+pub(crate) fn breadcrumb_label(path: &Path, fallback: &std::ffi::OsStr) -> String {
+    if path.as_os_str() == THIS_PC_SENTINEL {
+        return THIS_PC_LABEL.to_string();
+    }
+    let name = shell_display_name(path);
+    if name.is_empty() {
+        fallback.to_string_lossy().into_owned()
+    } else {
+        name
+    }
+}
+
+/// 「此电脑」箭头下的列表：先是桌面/文档/下载/音乐/图片/视频，再是各盘符。顺序与 Windows 11 地址栏一致。
+pub(crate) fn this_pc_entries() -> Vec<(PathBuf, String)> {
+    #[cfg(windows)]
+    {
+        let mut out = Vec::new();
+        for folder in known_this_pc_folders() {
+            if folder.is_dir() {
+                let label = shell_display_name(&folder);
+                out.push((folder, label));
+            }
+        }
+        let mut drives = list_drives_windows();
+        drives.sort_by(|a, b| logical_cmp(&shell_display_name(a), &shell_display_name(b)));
+        for drive in drives {
+            let label = shell_display_name(&drive);
+            out.push((drive, label));
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// 某一级箭头下的子文件夹。只含目录，隐藏和系统目录不出现，按资源管理器的逻辑顺序排列。
+pub(crate) fn list_child_folders(path: &Path) -> Vec<(PathBuf, String)> {
+    let mut entries: Vec<(PathBuf, String)> = match std::fs::read_dir(path) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir() && !is_hidden_or_system(&e.path()))
+            .map(|e| {
+                let path = e.path();
+                let label = shell_display_name(&path);
+                (path, label)
+            })
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    entries.sort_by(|a, b| logical_cmp(&a.1, &b.1));
+    entries
+}
+
+/// 空间不够时从左侧收起。Windows 11 保留右侧各级，左侧只留一个箭头；点它列出被收起的上级。
+/// 每一级右边都有自己的箭头，所以宽度按「名称 + 箭头」计算。
+/// 返回 (start_index, 箭头按钮宽度)。start_index > 0 时只显示 labels[start_index..]。
 pub(crate) fn breadcrumb_collapse_start(
     ui: &egui::Ui,
-    segments: &[(PathBuf, OsString)],
+    labels: &[String],
     available_width: f32,
-) -> (usize, Vec<f32>, f32, f32) {
+) -> (usize, f32) {
     let font_id = egui::FontId::proportional(12.0);
     let color = egui::Color32::PLACEHOLDER;
-    let sep_galley = ui.fonts(|f| f.layout_no_wrap(" › ".to_string(), font_id.clone(), color));
-    let sep_w = sep_galley.size().x;
-    let ellipsis_galley = ui.fonts(|f| f.layout_no_wrap("…".to_string(), font_id.clone(), color));
-    let ellipsis_btn_w = ellipsis_galley.size().x + BREADCRUMB_BTN_PADDING_X;
+    let chevron_galley = ui.fonts(|f| f.layout_no_wrap("›".to_string(), font_id.clone(), color));
+    let chevron_w = chevron_galley.size().x + 14.0;
 
-    let mut seg_widths = Vec::with_capacity(segments.len());
-    for (_, label) in segments.iter() {
-        let s = label.to_string_lossy().to_string();
-        let galley = ui.fonts(|f| f.layout_no_wrap(s, font_id.clone(), color));
+    let mut seg_widths = Vec::with_capacity(labels.len());
+    for label in labels {
+        let galley = ui.fonts(|f| f.layout_no_wrap(label.clone(), font_id.clone(), color));
         seg_widths.push(galley.size().x + BREADCRUMB_BTN_PADDING_X);
     }
 
-    let n = segments.len();
+    let n = labels.len();
     if n == 0 {
-        return (0, seg_widths, sep_w, ellipsis_btn_w);
+        return (0, chevron_w);
     }
 
-    let full_width: f32 = seg_widths.iter().sum::<f32>() + (n as f32 - 1.0) * sep_w;
+    let full_width: f32 = seg_widths.iter().sum::<f32>() + n as f32 * chevron_w;
     let avail = (available_width - 4.0).max(20.0);
     if full_width <= avail {
-        return (0, seg_widths, sep_w, ellipsis_btn_w);
+        return (0, chevron_w);
     }
 
-    let mut start_index = 0;
+    let mut start_index = n - 1;
     for start in 0..n {
-        let mut w = if start > 0 { ellipsis_btn_w + sep_w } else { 0.0 };
-        for i in start..n {
-            w += seg_widths[i];
-            if i < n - 1 {
-                w += sep_w;
-            }
+        let mut w = chevron_w;
+        for width in &seg_widths[start..] {
+            w += width + chevron_w;
         }
         if w <= avail {
             start_index = start;
-        } else {
             break;
         }
     }
-    (start_index, seg_widths, sep_w, ellipsis_btn_w)
+    (start_index, chevron_w)
+}
+
+fn logical_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::StrCmpLogicalW;
+        let aw: Vec<u16> = std::ffi::OsStr::new(a).encode_wide().chain(Some(0)).collect();
+        let bw: Vec<u16> = std::ffi::OsStr::new(b).encode_wide().chain(Some(0)).collect();
+        let ord = unsafe { StrCmpLogicalW(PCWSTR(aw.as_ptr()), PCWSTR(bw.as_ptr())) };
+        ord.cmp(&0)
+    }
+    #[cfg(not(windows))]
+    {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    }
+}
+
+fn is_hidden_or_system(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const HIDDEN: u32 = 0x2;
+        const SYSTEM: u32 = 0x4;
+        if let Ok(meta) = std::fs::metadata(path) {
+            return meta.file_attributes() & (HIDDEN | SYSTEM) != 0;
+        }
+    }
+    let _ = path;
+    false
+}
+
+#[cfg(windows)]
+fn windows_display_name(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_DISPLAYNAME};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut info = SHFILEINFOW::default();
+    let ok = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(std::ptr::addr_of_mut!(info)),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_DISPLAYNAME,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let len = info.szDisplayName.iter().position(|&c| c == 0).unwrap_or(info.szDisplayName.len());
+    let name = String::from_utf16_lossy(&info.szDisplayName[..len]);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(windows)]
+fn known_this_pc_folders() -> Vec<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music,
+        FOLDERID_Pictures, FOLDERID_Videos, KF_FLAG_DEFAULT,
+    };
+    let ids = [
+        &FOLDERID_Desktop,
+        &FOLDERID_Documents,
+        &FOLDERID_Downloads,
+        &FOLDERID_Music,
+        &FOLDERID_Pictures,
+        &FOLDERID_Videos,
+    ];
+    let mut out = Vec::new();
+    for id in ids {
+        let Ok(pw) = (unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }) else {
+            continue;
+        };
+        let text = unsafe { pw.to_string() }.unwrap_or_default();
+        unsafe { CoTaskMemFree(Some(pw.0 as *const _)) };
+        if !text.is_empty() {
+            out.push(PathBuf::from(text));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

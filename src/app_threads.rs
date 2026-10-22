@@ -191,14 +191,14 @@ pub(crate) fn run_loader_thread(
     drop(tx);
 }
 
-/// 后台纹理解码线程：从 req_rx 收 path，解码为 RGBA（大图缩略图），通过 res_tx 回传；主线程只做 GPU 上传。
+/// 后台纹理解码线程：从 req_rx 收 path 和目标最长边，解码为 RGBA 缩略图，通过 res_tx 回传；主线程只做 GPU 上传。
 pub(crate) fn run_texture_loader_thread(
-    req_rx: mpsc::Receiver<PathBuf>,
+    req_rx: mpsc::Receiver<(PathBuf, u32)>,
     res_tx: mpsc::Sender<(PathBuf, Vec<u8>, u32, u32)>,
     repaint: RepaintHook,
 ) {
-    for path in req_rx {
-        if let Ok((rgba, w, h)) = image_ops::load_image_rgba_for_texture(&path) {
+    for (path, max_edge) in req_rx {
+        if let Ok((rgba, w, h)) = image_ops::load_image_rgba_for_texture(&path, max_edge) {
             if res_tx.send((path, rgba, w, h)).is_ok() {
                 wake_ui(&repaint);
             }

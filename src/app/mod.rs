@@ -16,7 +16,7 @@ use crate::app_viewport::CardScreenRect;
 use crate::layout;
 use eframe::egui::{self, ColorImage, TextureHandle, Vec2};
 use rstar::RTree;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -169,8 +169,8 @@ pub struct DeckRefApp {
     right_drag_started: bool,
     /// 上一帧发送的窗口位置（目标 = last_sent + delta 取整，减少累积误差）
     right_drag_last_sent: Option<egui::Pos2>,
-    /// 纹理加载请求发送端：主线程只发 path，后台线程解码后通过 texture_loading_rx 回传 RGBA
-    texture_loading_tx: Option<mpsc::Sender<PathBuf>>,
+    /// 纹理加载请求发送端：主线程发送 path 和目标最长边，后台线程解码后通过 texture_loading_rx 回传 RGBA
+    texture_loading_tx: Option<mpsc::Sender<(PathBuf, u32)>>,
     /// 后台解码完成的纹理 (path, rgba, width, height)，主线程每帧取若干做 GPU 上传
     texture_loading_rx: Option<mpsc::Receiver<(PathBuf, Vec<u8>, u32, u32)>>,
     /// 纹理加载线程 handle，进程退出时 drop 即可
@@ -187,8 +187,8 @@ pub struct DeckRefApp {
     last_board_screen_center: Option<egui::Vec2>,
     /// 默认/灵感模式：上一帧堆叠区中心（屏幕坐标），用于窗口 resize 时补偿 view_offset，避免所有图片移位
     last_stack_screen_center: Option<egui::Vec2>,
-    /// 已请求但尚未收到结果的 path，避免重复请求；切换文件夹/清空时清空
-    pending_texture_paths: HashSet<PathBuf>,
+    /// 已请求但尚未收到的纹理目标边长。同一张图只保留当前最大的请求，避免总览档和图放大档互相覆盖。
+    pending_texture_paths: HashMap<PathBuf, u32>,
     /// 后台线程用来在异步结果到达时唤醒 UI。
     repaint_ctx: RepaintHook,
     /// 监听事件的 dimensions/metadata 请求。generation 用于丢弃切换文件夹前的旧任务。
@@ -340,7 +340,7 @@ impl DeckRefApp {
             board_view_offset: egui::Vec2::ZERO,
             last_board_screen_center: None,
             last_stack_screen_center: None,
-            pending_texture_paths: HashSet::new(),
+            pending_texture_paths: HashMap::new(),
             repaint_ctx,
             watch_io_tx,
             watch_io_rx,
@@ -1018,31 +1018,44 @@ impl DeckRefApp {
         }
     }
 
-    /// 确保纹理已加载；若失败则返回 None，不 panic。
-    /// 优先走后台解码线程（请求入队、本帧返回 None），主线程仅在 poll_texture_results 中做 GPU 上传。
-    /// 无后台线程时的回退路径仅在 spawn 失败时触发；回退中仍用缩略图（>2048px 用 load_image_thumbnail），主线程绝不完整解码超大图。
-    fn ensure_texture(&mut self, ctx: &egui::Context, path: &PathBuf) -> Option<&TextureHandle> {
-        if self.texture_cache.contains_key(path) {
+    fn cached_texture_edge(&self, path: &std::path::Path) -> u32 {
+        self.texture_cache
+            .get(path)
+            .map(|tex| {
+                let [w, h] = tex.size();
+                w.max(h) as u32
+            })
+            .unwrap_or(0)
+    }
+
+    /// 确保纹理已加载到至少 `max_edge`；已有更小的缩略图时先返回它，并在后台换更大的一档。
+    /// 优先走后台解码线程，主线程仅在 poll_texture_results 中做 GPU 上传。
+    /// 无后台线程时的回退仍用缩略图，主线程绝不完整解码超大图。
+    fn ensure_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &PathBuf,
+        max_edge: u32,
+    ) -> Option<&TextureHandle> {
+        let max_edge = max_edge.max(1);
+        let cached_edge = self.cached_texture_edge(path);
+        if cached_edge >= max_edge {
             return self.texture_cache.get(path);
         }
-        if let Some(ref tx) = self.texture_loading_tx {
-            if self.pending_texture_paths.contains(path) {
-                return None;
+        if let Some(tx) = self.texture_loading_tx.clone() {
+            let pending_edge = self.pending_texture_paths.get(path).copied().unwrap_or(0);
+            if pending_edge < max_edge {
+                let _ = tx.send((path.clone(), max_edge));
+                self.pending_texture_paths.insert(path.clone(), max_edge);
             }
-            let _ = tx.send(path.clone());
-            self.pending_texture_paths.insert(path.clone());
-            return None;
+            return self.texture_cache.get(path);
         }
-        // 回退：无后台线程时同步解码（避免 spawn 失败后无法显示图）。
-        // 最长边 > 2048 时，仅 JPEG/WebP 走解码期缩小；其余格式不在主线程完整解码。
+        // 回退：无后台线程时同步解码。超大图只走 JPEG/WebP 的解码期缩小。
         let img = match image_ops::image_dimensions(path) {
-            Ok((w, h)) if w.max(h) > image_ops::THUMBNAIL_RESOLUTION_THRESHOLD => {
-                if !image_ops::subsamples_when_downscaling(path) {
-                    return None;
-                }
-                image_ops::load_image_thumbnail(path, image_ops::THUMBNAIL_MAX_LONGEST_EDGE).ok()
+            Ok((w, h)) if w.max(h) > max_edge && !image_ops::subsamples_when_downscaling(path) && w.max(h) > image_ops::THUMBNAIL_RESOLUTION_THRESHOLD => {
+                return self.texture_cache.get(path);
             }
-            _ => image_ops::load_image(path).ok(),
+            _ => image_ops::load_image_thumbnail(path, max_edge).ok(),
         }?;
         let size = [img.width() as usize, img.height() as usize];
         let rgba = img.to_rgba8();
@@ -1074,8 +1087,14 @@ impl DeckRefApp {
             let Ok((path, rgba, width, height)) = rx.try_recv() else {
                 break;
             };
-            self.pending_texture_paths.remove(&path);
+            let got_edge = width.max(height);
+            if self.pending_texture_paths.get(&path).copied().unwrap_or(0) <= got_edge {
+                self.pending_texture_paths.remove(&path);
+            }
             if !self.cards.iter().any(|c| c.path == path) {
+                continue;
+            }
+            if self.cached_texture_edge(&path) >= got_edge {
                 continue;
             }
             let size = [width as usize, height as usize];
